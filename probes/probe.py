@@ -641,37 +641,65 @@ def console_sharers(pid: int) -> list[int] | str:
     return json.loads(result.stdout) if result.returncode == 0 else f"could not attach: {result.stdout.strip()}"
 
 
-def send_ctrl_c(session: Session) -> dict[str, object]:
-    result = run_ctrl_c(str(session.pid))
+def send_ctrl_c(pid: int) -> dict[str, object]:
+    result = run_ctrl_c(str(pid))
     observations: dict[str, object] = {"ctrl_c.py exit code": result.returncode}
     if result.stdout.strip():
         observations["ctrl_c.py output"] = result.stdout.strip()
     return observations
 
 
-def send_sigterm(session: Session) -> dict[str, object]:
-    os.kill(session.pid, signal.SIGTERM)
+def send_sigterm(pid: int) -> dict[str, object]:
+    os.kill(pid, signal.SIGTERM)
     return {}
 
 
-def observe_stop(session: Session, request_stop: Callable[[Session], dict[str, object]]) -> dict[str, object]:
+@dataclass
+class StopTarget:
+    """What a stop probe needs to know about the process it stops, whether or not it is our child."""
+
+    pid: int
+    record_path: Path
+    has_exited: Callable[[], bool]
+    exit_code: Callable[[], int | None] | None = None  # None: not observable, the process is not our child
+
+
+def is_running(pid: int) -> bool:
+    """False once the process is gone or only a zombie waiting to be reaped by its parent."""
+    try:
+        return psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
+        return False
+    except psutil.Error:
+        return True
+
+
+def stop_target(session: Session) -> StopTarget:
+    return StopTarget(session.pid, session.record_path, lambda: session.exit_code() is not None, session.exit_code)
+
+
+def observe_stop(target: StopTarget, request_stop: Callable[[int], dict[str, object]]) -> dict[str, object]:
     """Sends the system's stop request and records the four observations every stop probe reports."""
-    sharers: list[int] | str | None = console_sharers(session.pid) if sys.platform == "win32" else None
+    sharers: list[int] | str | None = console_sharers(target.pid) if sys.platform == "win32" else None
     started = time.monotonic()
-    observations = request_stop(session)
-    while session.exit_code() is None and time.monotonic() - started < STOP_TIMEOUT_SECONDS:
+    observations: dict[str, object]
+    try:
+        observations = request_stop(target.pid)
+    except Exception as error:
+        observations = {"stop request": describe_error(error)}
+    while not target.has_exited() and time.monotonic() - started < STOP_TIMEOUT_SECONDS:
         time.sleep(0.1)
-    exited = session.exit_code() is not None
+    exited = target.has_exited()
     observations["exited within 10 s"] = f"yes, after {time.monotonic() - started:.1f} s" if exited else "no"
-    observations["exit code"] = session.exit_code()
+    observations["exit code"] = target.exit_code() if target.exit_code else "<not observable: not a child process>"
     removal_deadline = time.monotonic() + RECORD_REMOVAL_SECONDS
-    while session.record_path.exists() and time.monotonic() < removal_deadline:
+    while target.record_path.exists() and time.monotonic() < removal_deadline:
         time.sleep(0.1)
-    observations["session record removed"] = not session.record_path.exists()
+    observations["session record removed"] = not target.record_path.exists()
     if isinstance(sharers, str):
         observations["other processes on its console"] = sharers
     elif sharers is not None:
-        others = [other for other in sharers if other != session.pid]
+        others = [other for other in sharers if other != target.pid]
         alive = []
         for other in others:
             try:
@@ -683,7 +711,7 @@ def observe_stop(session: Session, request_stop: Callable[[Session], dict[str, o
     return observations
 
 
-def stop_probe(name: str, question: str, mode: Mode, request_stop: Callable[[Session], dict[str, object]]) -> None:
+def stop_probe(name: str, question: str, mode: Mode, request_stop: Callable[[int], dict[str, object]]) -> None:
     session = start_session(mode)
     if session is None:
         report(name, question, {"session": "did not start", "process exit code": last_start_failure.get("exit_code")})
@@ -700,7 +728,7 @@ def stop_probe(name: str, question: str, mode: Mode, request_stop: Callable[[Ses
             observations["flags passed"] = PIPED_FLAGS
             observations["environment imitated"] = "CLAUDE_CODE_ENTRYPOINT=claude-vscode"
         wait_for_status(session, "idle", IDLE_TIMEOUT_SECONDS)
-        observations.update(observe_stop(session, request_stop))
+        observations.update(observe_stop(stop_target(session), request_stop))
     finally:
         session.close()
     report(name, question, observations)
@@ -736,13 +764,156 @@ def p5() -> None:
     )
 
 
+def service_check(config_dir: Path, pid: int, out_file: Path) -> int:
+    """Run by the service manager: what a daemon started there can see, then the stop request and its outcome."""
+    record_path = config_dir / "sessions" / f"{pid}.json"
+    observations: dict[str, object] = {}
+    try:
+        json.loads(record_path.read_text(encoding="utf-8"))
+        observations["session record readable"] = "yes"
+    except Exception as error:
+        observations["session record readable"] = describe_error(error)
+    observations["target process visible"] = psutil.pid_exists(pid)
+    request_stop = send_ctrl_c if sys.platform == "win32" else send_sigterm
+    observations.update(observe_stop(StopTarget(pid, record_path, lambda: not is_running(pid)), request_stop))
+    partial = out_file.with_name(out_file.name + ".partial")
+    partial.write_text("\n".join(format_observation(key, value) for key, value in observations.items()), encoding="utf-8")
+    partial.replace(out_file)  # appears complete or not at all
+    return 0
+
+
+SERVICE_LABEL = "com.claude-reaper.probe"
+SERVICE_TASK = "claude-reaper-probe"
+SERVICE_WAIT_SECONDS = 30
+SCHTASKS_FIELDS = ("Status", "Last Result", "Logon Mode")
+
+
+def service_check_command(session: Session, out_file: Path) -> list[str]:
+    return [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--service-check",
+        str(session.config_dir),
+        str(session.pid),
+        str(out_file),
+    ]
+
+
+def run_tool(*command: str) -> str:
+    """Runs a service-manager command; its exit code and output as one observation."""
+    result = subprocess.run(command, capture_output=True, text=True, timeout=60)
+    output = (result.stdout + result.stderr).strip()
+    return f"exit code {result.returncode}: {output or '<no output>'}"
+
+
+def wait_for_file(path: Path, timeout_seconds: float) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if path.exists():
+            return True
+        time.sleep(0.5)
+    return path.exists()
+
+
+def p6_macos(session: Session, work: Path, out_file: Path) -> dict[str, object]:
+    import plistlib
+
+    log_file = work / "service.log"
+    plist_path = work / f"{SERVICE_LABEL}.plist"
+    plist_path.write_bytes(
+        plistlib.dumps(
+            {
+                "Label": SERVICE_LABEL,
+                "ProgramArguments": service_check_command(session, out_file),
+                "RunAtLoad": True,
+                "StandardOutPath": str(log_file),
+                "StandardErrorPath": str(log_file),
+            }
+        )
+    )
+    observations: dict[str, object] = {"service manager": "launchd user agent"}
+    uid = os.getuid()
+    domain = None
+    for candidate in (f"gui/{uid}", f"user/{uid}"):
+        outcome = run_tool("launchctl", "bootstrap", candidate, str(plist_path))
+        observations[f"launchctl bootstrap {candidate.split('/')[0]}/<uid>"] = outcome
+        if outcome.startswith("exit code 0"):
+            domain = candidate
+            break
+    if domain is not None:
+        wait_for_file(out_file, SERVICE_WAIT_SECONDS)
+        observations["launchctl bootout"] = run_tool("launchctl", "bootout", f"{domain}/{SERVICE_LABEL}")
+    if log_file.exists():
+        observations["service stdout and stderr"] = log_file.read_text(encoding="utf-8", errors="replace").strip() or "<empty>"
+    return observations
+
+
+def p6_windows(session: Session, work: Path, out_file: Path) -> dict[str, object]:
+    wrapper = work / "service-check.cmd"
+    wrapper.write_text(f"@echo off\r\n{subprocess.list2cmdline(service_check_command(session, out_file))}\r\n", encoding="utf-8")
+    task_command = f'"{wrapper}"' if " " in str(wrapper) else str(wrapper)
+    observations: dict[str, object] = {
+        "service manager": "Task Scheduler task, trigger at logon, interactive only (/it)",
+        "caveat": "a logon cannot be triggered in CI; schtasks /run stands in for the logon trigger",
+        "command file": "a .cmd wrapper holding the --service-check command, because /tr is limited to 261 characters",
+    }
+    observations["schtasks /create"] = run_tool(
+        "schtasks", "/create", "/tn", SERVICE_TASK, "/sc", "onlogon", "/it", "/tr", task_command, "/f"
+    )
+    observations["schtasks /run"] = run_tool("schtasks", "/run", "/tn", SERVICE_TASK)
+    wait_for_file(out_file, SERVICE_WAIT_SECONDS)
+    details = run_tool("schtasks", "/query", "/tn", SERVICE_TASK, "/fo", "list", "/v")
+    observations["schtasks /query"] = "; ".join(
+        line.strip() for line in details.splitlines() if line.startswith(SCHTASKS_FIELDS)
+    ) or "<fields not found>"
+    observations["schtasks /delete"] = run_tool("schtasks", "/delete", "/tn", SERVICE_TASK, "/f")
+    return observations
+
+
+@probe
+def p6() -> None:
+    if sys.platform not in ("darwin", "win32"):
+        return
+    question = "Can a daemon started by the service manager see and stop a session in the user's login session?"
+    mode: Mode = "pty" if sys.platform == "darwin" else "console"
+    session = start_session(mode)
+    if session is None:
+        report("P6", question, {"session": "did not start", "process exit code": last_start_failure.get("exit_code")})
+        return
+    work = Path(tempfile.mkdtemp(prefix="reaper-probe-service-"))
+    out_file = work / "service-check.out"
+    try:
+        wait_for_status(session, "idle", IDLE_TIMEOUT_SECONDS)
+        observations: dict[str, object] = {"launch mode": mode}
+        observations.update((p6_macos if sys.platform == "darwin" else p6_windows)(session, work, out_file))
+        observations["service-check output"] = (
+            out_file.read_text(encoding="utf-8") if out_file.exists() else f"<absent after {SERVICE_WAIT_SECONDS} s>"
+        )
+        observations["session exit code seen by the probe afterwards"] = session.exit_code()
+    finally:
+        session.close()
+        shutil.rmtree(work, ignore_errors=True)
+    report("P6", question, observations)
+
+
 def main() -> int:
     global results_label, seed_state
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
-    parser.add_argument("--os", required=True, choices=["linux", "macos", "windows"], dest="os_label")
+    parser.add_argument("--os", choices=["linux", "macos", "windows"], dest="os_label")
     parser.add_argument("--no-seed", action="store_true", help="diagnostic: start with an empty config dir, as a first run")
+    parser.add_argument(
+        "--service-check",
+        nargs=3,
+        metavar=("CONFIG_DIR", "PID", "OUT_FILE"),
+        help="run by the service manager in P6, not by the workflow",
+    )
     arguments = parser.parse_args()
+    if arguments.service_check:
+        config_dir, pid, out_file = arguments.service_check
+        return service_check(Path(config_dir), int(pid), Path(out_file))
+    if arguments.os_label is None:
+        parser.error("--os is required")
     results_label = arguments.os_label
     seed_state = not arguments.no_seed
 
