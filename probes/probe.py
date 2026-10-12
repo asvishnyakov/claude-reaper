@@ -27,6 +27,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+import psutil
+
 RESULTS_DIR = Path("results")
 RECORD_TIMEOUT_SECONDS = 60
 IDLE_TIMEOUT_SECONDS = 60
@@ -405,6 +407,135 @@ def p1() -> bool:
         session.close()
     report("P1", question, observations)
     return True
+
+
+def proc_stat_start_ticks(pid: int) -> str:
+    stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    return stat[stat.rindex(")") + 2 :].split()[19]
+
+
+def ps_lstart(pid: int, extra_env: dict[str, str]) -> str:
+    result = subprocess.run(
+        ["ps", "-o", "lstart=", "-p", str(pid)],
+        capture_output=True,
+        text=True,
+        check=True,
+        env={**os.environ, **extra_env},
+    )
+    return result.stdout.strip()
+
+
+def creation_filetime(pid: int) -> str:
+    """Creation time from GetProcessTimes, as the decimal 64-bit FILETIME."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE, *[ctypes.POINTER(wintypes.FILETIME)] * 4]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    process_query_limited_information = 0x1000
+    handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
+    try:
+        creation, exited, kernel, user = (wintypes.FILETIME() for _ in range(4))
+        if not kernel32.GetProcessTimes(handle, *(ctypes.byref(times) for times in (creation, exited, kernel, user))):
+            raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
+        return str((creation.dwHighDateTime << 32) | creation.dwLowDateTime)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def cim_creation_date(pid: int) -> str:
+    command = f'(Get-CimInstance Win32_Process -Filter "ProcessId={pid}").CreationDate.ToString("o")'
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-Command", command], capture_output=True, text=True, check=True
+    )
+    return result.stdout.strip()
+
+
+def start_time_candidates(pid: int) -> dict[str, Callable[[], str]]:
+    """The OS values that `procStart` might equal, per system."""
+    candidates: dict[str, Callable[[], str]] = {}
+    if sys.platform.startswith("linux"):
+        candidates["field 22 of /proc/<pid>/stat"] = lambda: proc_stat_start_ticks(pid)
+    elif sys.platform == "darwin":
+        candidates["ps -o lstart= with LC_ALL=C TZ=UTC"] = lambda: ps_lstart(pid, {"LC_ALL": "C", "TZ": "UTC"})
+        candidates["ps -o lstart= with the inherited environment"] = lambda: ps_lstart(pid, {})
+    elif sys.platform == "win32":
+        candidates["GetProcessTimes creation FILETIME"] = lambda: creation_filetime(pid)
+        candidates["Win32_Process.CreationDate"] = lambda: cim_creation_date(pid)
+    candidates["psutil create_time()"] = lambda: repr(psutil.Process(pid).create_time())
+    return candidates
+
+
+def describe_error(error: Exception) -> str:
+    return f"<{type(error).__name__}: {error}>"
+
+
+@probe
+def p2() -> None:
+    question = "What do procStart and procStartFt contain, and which OS value does each equal?"
+    modes: list[Mode] = ["pty", "console"] if sys.platform == "win32" else ["pty"]
+    for mode in modes:
+        session = start_session(mode)
+        name = f"P2 ({mode})"
+        if session is None:
+            report(name, question, {"session": "did not start", "process exit code": last_start_failure.get("exit_code")})
+            continue
+        try:
+            record = session.record() or {}
+            observations: dict[str, object] = {
+                "procStart": record.get("procStart", "<absent>"),
+                "procStartFt": record.get("procStartFt", "<absent>"),
+            }
+            for label, candidate in start_time_candidates(session.pid).items():
+                try:
+                    value = candidate()
+                except Exception as error:
+                    observations[label] = describe_error(error)
+                    continue
+                equals = [key for key in ("procStart", "procStartFt") if str(record.get(key)) == value]
+                observations[label] = f"{value}; equal as a string to: {', '.join(equals) or 'neither'}"
+        finally:
+            session.close()
+        report(name, question, observations)
+
+
+ENVIRONMENT_READ_CALL = {
+    "linux": "read /proc/<pid>/environ",
+    "darwin": "sysctl KERN_PROCARGS2",
+    "win32": "reading the process environment block with ReadProcessMemory",
+}
+
+
+@probe
+def p7() -> None:
+    question = "Can the reaper read CLAUDE_CONFIG_DIR from the environment of a session started by the same user?"
+    observations: dict[str, object] = {
+        "underlying OS call (via psutil.Process.environ)": ENVIRONMENT_READ_CALL.get(sys.platform, sys.platform),
+    }
+    session = start_session("pty")
+    if session is None:
+        observations["session"] = "did not start"
+        report("P7", question, observations)
+        return
+    try:
+        try:
+            value = psutil.Process(session.pid).environ().get("CLAUDE_CONFIG_DIR")
+        except Exception as error:
+            observations["result"] = describe_error(error)
+        else:
+            observations["variable present"] = value is not None
+            observations["equals the config dir given at launch"] = value == str(session.config_dir)
+            observations["equals it after resolving both paths"] = (
+                value is not None and Path(value).resolve() == session.config_dir.resolve()
+            )
+    finally:
+        session.close()
+    report("P7", question, observations)
 
 
 def main() -> int:
