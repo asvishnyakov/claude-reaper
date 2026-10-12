@@ -31,6 +31,9 @@ class RedactTests(unittest.TestCase):
             "Do you trust the files in this folder?\n<redacted>\nPress Enter to continue",
         )
 
+    def test_strict_mode_does_not_keep_a_line_just_because_it_is_a_question(self) -> None:
+        self.assertEqual(probe.redact("Are you Alice Smith?", strict=True), "<redacted>")
+
     def test_strict_mode_still_redacts_identity_lines_that_use_dialog_wording(self) -> None:
         raw = "Welcome, press Enter to continue\nSign in as user@example.com"
 

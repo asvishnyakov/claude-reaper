@@ -51,7 +51,7 @@ IDENTITY_LINE_PATTERN = re.compile(r"welcome|organi[sz]ation", re.IGNORECASE)
 # the main screen shows account details that no list of patterns can be sure to catch.
 DIALOG_LINE_PATTERN = re.compile(
     r"\b(?:trust|folder|theme|style|log ?in|sign in|onboarding|press|continue|select|choose|"
-    r"connect|network|proxy|error|failed|unable|update|terminal|permission|api key|dialog)\b|\?",
+    r"connect|network|proxy|error|failed|unable|update|terminal|permission|api key|dialog)\b",
     re.IGNORECASE,
 )
 ACCOUNT_SEPARATOR_PATTERN = re.compile(r"[@·•|]")
