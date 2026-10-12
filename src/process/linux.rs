@@ -23,10 +23,17 @@ pub fn identity(pid: u32, proc_start: Option<&str>) -> Identity {
     };
     match parse_start_ticks(&stat) {
         None | Some(('Z', _)) => Identity::Gone,
-        Some((_, start_ticks)) => match proc_start {
-            Some(recorded) if recorded != start_ticks => Identity::Different,
-            _ => Identity::Same,
-        },
+        Some((_, start_ticks)) => {
+            // A session record can name any PID; only this user's own processes are ever ours to stop.
+            let own_uid = rustix::process::getuid().as_raw();
+            let is_own = fs::metadata(format!("/proc/{pid}"))
+                .is_ok_and(|metadata| metadata.uid() == own_uid);
+            match proc_start {
+                _ if !is_own => Identity::Different,
+                Some(recorded) if recorded != start_ticks => Identity::Different,
+                _ => Identity::Same,
+            }
+        }
     }
 }
 
@@ -83,6 +90,29 @@ mod tests {
     #[test]
     fn own_process_with_a_wrong_start_is_different() {
         assert_eq!(identity(std::process::id(), Some("1")), Identity::Different);
+    }
+
+    /// A running process that belongs to another user, if this system has one.
+    fn pid_of_another_user() -> Option<u32> {
+        let own_uid = rustix::process::getuid().as_raw();
+        fs::read_dir("/proc")
+            .ok()?
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .metadata()
+                    .is_ok_and(|metadata| metadata.uid() != own_uid)
+            })
+            .find_map(|entry| entry.file_name().to_str()?.parse().ok())
+    }
+
+    #[test]
+    fn process_of_another_user_is_different() {
+        let Some(pid) = pid_of_another_user() else {
+            return;
+        };
+
+        assert_eq!(identity(pid, None), Identity::Different);
     }
 
     #[test]
