@@ -370,16 +370,16 @@ def seed_config(config_dir: Path, workdir: Path, version: str) -> None:
     (config_dir / ".claude.json").write_text(json.dumps(state), encoding="utf-8")
 
 
-def session_env(config_dir: Path) -> dict[str, str]:
+def session_env(config_dir: Path, extra_env: dict[str, str] | None = None, token: bool = True) -> dict[str, str]:
     """A clean environment: nothing of the developer's own Claude or Anthropic settings leaks in."""
     env = {key: value for key, value in os.environ.items() if not key.upper().startswith(("CLAUDE", "ANTHROPIC"))}
     env["CLAUDE_CONFIG_DIR"] = str(config_dir)
     env["TERM"] = "xterm-256color"
     env["DISABLE_AUTOUPDATER"] = "1"
-    token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
-    if token:
-        env["CLAUDE_CODE_OAUTH_TOKEN"] = token
-    return env
+    oauth_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+    if token and oauth_token:
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = oauth_token
+    return {**env, **(extra_env or {})}
 
 
 def launch(mode: Mode, argv: list[str], env: dict[str, str], cwd: Path) -> Launched:
@@ -392,15 +392,18 @@ def launch(mode: Mode, argv: list[str], env: dict[str, str], cwd: Path) -> Launc
     raise ValueError(f"launch mode {mode!r} is not available on {sys.platform}")
 
 
-def start_session(mode: Mode) -> Session | None:
-    """Fresh config dir, seeded state, real `claude`; waits up to 60 s for the record. None if it never appears."""
+def start_session(mode: Mode, *, extra_env: dict[str, str] | None = None, token: bool = True) -> Session | None:
+    """Fresh config dir, seeded state, real `claude`; waits up to 60 s for the record. None if it never appears.
+
+    `extra_env` adds to the session's environment; `token=False` withholds CLAUDE_CODE_OAUTH_TOKEN.
+    """
     last_start_failure.clear()
     version = claude_version()
     config_dir = Path(tempfile.mkdtemp(prefix="reaper-probe-config-"))
     workdir = Path(tempfile.mkdtemp(prefix="reaper-probe-cwd-")).resolve()
     if seed_state:
         seed_config(config_dir, workdir, version)
-    env = session_env(config_dir)
+    env = session_env(config_dir, extra_env, token)
     argv = [claude_path()]
     if mode == "piped":
         env["CLAUDE_CODE_ENTRYPOINT"] = "claude-vscode"
@@ -467,17 +470,24 @@ def probe(function: Callable[[], bool | None]) -> Callable[[], bool | None]:
 
 @probe
 def p1() -> bool:
-    question = "Does an interactive session start unattended with a token and pre-seeded onboarding state, and write a session record?"
+    started = run_p1("P1", token=True)
+    if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
+        run_p1("P1 (repeated without the token)", token=False)
+    return started
+
+
+def run_p1(name: str, token: bool) -> bool:
+    question = "Does an interactive session start unattended with pre-seeded onboarding state, and write a session record?"
     observations: dict[str, object] = {
         "Claude Code version": claude_version(),
-        "token provided": bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")),
+        "token provided": token and bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")),
     }
-    session = start_session("pty")
+    session = start_session("pty", token=token)
     if session is None:
         observations["record appeared"] = f"no, within {RECORD_TIMEOUT_SECONDS} s"
         observations["process exit code"] = last_start_failure.get("exit_code")
         observations["screen text (redacted)"] = last_start_failure.get("screen") or "<empty>"
-        report("P1", question, observations)
+        report(name, question, observations)
         return False
     try:
         record = session.record() or {}
@@ -493,7 +503,7 @@ def p1() -> bool:
         )
     finally:
         session.close()
-    report("P1", question, observations)
+    report(name, question, observations)
     return True
 
 
@@ -544,14 +554,14 @@ def cim_creation_date(pid: int) -> str:
     return result.stdout.strip()
 
 
-def start_time_candidates(pid: int) -> dict[str, Callable[[], str]]:
+def start_time_candidates(pid: int, session_overrides: dict[str, str]) -> dict[str, Callable[[], str]]:
     """The OS values that `procStart` might equal, per system."""
     candidates: dict[str, Callable[[], str]] = {}
     if sys.platform.startswith("linux"):
         candidates["field 22 of /proc/<pid>/stat"] = lambda: proc_stat_start_ticks(pid)
     elif sys.platform == "darwin":
         candidates["ps -o lstart= with LC_ALL=C TZ=UTC"] = lambda: ps_lstart(pid, {"LC_ALL": "C", "TZ": "UTC"})
-        candidates["ps -o lstart= with the inherited environment"] = lambda: ps_lstart(pid, {})
+        candidates["ps -o lstart= with the session's own environment"] = lambda: ps_lstart(pid, session_overrides)
     elif sys.platform == "win32":
         candidates["GetProcessTimes creation FILETIME"] = lambda: creation_filetime(pid)
         candidates["Win32_Process.CreationDate"] = lambda: cim_creation_date(pid)
@@ -567,9 +577,14 @@ def describe_error(error: Exception) -> str:
 def p2() -> None:
     question = "What do procStart and procStartFt contain, and which OS value does each equal?"
     modes: list[Mode] = ["pty", "console"] if sys.platform == "win32" else ["pty"]
-    for mode in modes:
-        session = start_session(mode)
-        name = f"P2 ({mode})"
+    # The runners use UTC, which cannot show whether local time matters. macOS repeats with a zone far from UTC.
+    variants: list[tuple[str, dict[str, str]]] = [("", {})]
+    if sys.platform == "darwin":
+        variants.append((", TZ=Pacific/Kiritimati", {"TZ": "Pacific/Kiritimati"}))
+    runs: list[tuple[Mode, str, dict[str, str]]] = [(mode, suffix, env) for mode in modes for suffix, env in variants]
+    for mode, suffix, session_overrides in runs:
+        session = start_session(mode, extra_env=session_overrides)
+        name = f"P2 ({mode}{suffix})"
         if session is None:
             report(name, question, {"session": "did not start", "process exit code": last_start_failure.get("exit_code")})
             continue
@@ -579,7 +594,7 @@ def p2() -> None:
                 "procStart": record.get("procStart", "<absent>"),
                 "procStartFt": record.get("procStartFt", "<absent>"),
             }
-            for label, candidate in start_time_candidates(session.pid).items():
+            for label, candidate in start_time_candidates(session.pid, session_overrides).items():
                 try:
                     value = candidate()
                 except Exception as error:

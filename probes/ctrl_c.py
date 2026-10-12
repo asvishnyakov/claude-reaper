@@ -5,11 +5,13 @@ Usage: ctrl_c.py [--list] <pid>
 Exit codes: 0 the event was generated, 2 AttachConsole failed (GetLastError is printed),
 3 GenerateConsoleCtrlEvent failed (GetLastError is printed).
 
-With --list nothing is sent: the IDs of all processes attached to that console are printed as JSON.
+With --list nothing is sent: the IDs of all processes attached to that console, except this helper,
+are printed as JSON.
 """
 
 import ctypes
 import json
+import os
 import sys
 from ctypes import wintypes
 
@@ -34,7 +36,7 @@ def main(arguments: list[str]) -> int:
         buffer = (wintypes.DWORD * MAX_LISTED_PROCESSES)()
         count = kernel32.GetConsoleProcessList(buffer, MAX_LISTED_PROCESSES)
         kernel32.FreeConsole()
-        print(json.dumps(list(buffer[:count])))
+        print(json.dumps([process for process in buffer[:count] if process != os.getpid()]))  # not this helper
         return 0
     kernel32.SetConsoleCtrlHandler(None, True)  # this process ignores its own event
     generated = kernel32.GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0)
