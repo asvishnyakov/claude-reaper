@@ -184,13 +184,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config_dir = dir.path().join("a");
         fs::create_dir_all(config_dir.join("sessions")).unwrap();
-        let mut candidates = vec![config_dir.clone(), config_dir.join("")];
+        let candidates = vec![config_dir.clone(), config_dir.join("")];
         #[cfg(unix)]
-        {
+        let candidates = {
             let link = dir.path().join("link");
             std::os::unix::fs::symlink(&config_dir, &link).unwrap();
-            candidates.push(link);
-        }
+            [candidates, vec![link]].concat()
+        };
 
         let kept = session_config_dirs(candidates);
 

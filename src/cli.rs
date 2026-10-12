@@ -221,6 +221,7 @@ mod tests {
         String::from_utf8(output).unwrap()
     }
 
+    #[cfg(target_os = "linux")]
     fn dir_name(dir: &Path) -> String {
         dir.file_name().unwrap().to_string_lossy().into_owned()
     }
