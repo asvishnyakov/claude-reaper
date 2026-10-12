@@ -13,8 +13,10 @@ import argparse
 import json
 import os
 import platform
+import queue
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -159,8 +161,6 @@ class _UnixPty:
 
     def force_close(self) -> None:
         """Test cleanup only: ask, wait, then force."""
-        import signal
-
         if self.poll() is None:
             os.kill(self.pid, signal.SIGTERM)
             deadline = time.monotonic() + CLEANUP_GRACE_SECONDS
@@ -228,13 +228,94 @@ class _WindowsConsole:
             self._process.wait()
 
 
+# What the VS Code extension passes (2.1.294), without the values that belong to one machine or
+# one conversation: --resume, and the debug flags.
+PIPED_FLAGS = [
+    "--output-format", "stream-json",
+    "--input-format", "stream-json",
+    "--verbose",
+    "--include-partial-messages",
+    "--replay-user-messages",
+    "--enable-auth-status",
+    "--no-chrome",
+    "--max-thinking-tokens=31999",
+    "--thinking-display=summarized",
+    "--permission-prompt-tool=stdio",
+    "--setting-sources=user,project,local",
+]  # fmt: skip
+PIPED_LAUNCHER = Path(__file__).with_name("spawn-piped.mjs")
+PIPED_LAUNCHER_TIMEOUT_SECONDS = 30
+
+
+class _Piped:
+    """Imitates the VS Code extension: piped stdio and no terminal. A Node launcher owns the child and the pipes."""
+
+    def __init__(self, argv: list[str], env: dict[str, str], cwd: Path) -> None:
+        node = shutil.which("node")
+        if node is None:
+            raise RuntimeError("node is not on PATH")
+        self._launcher = subprocess.Popen(
+            [node, str(PIPED_LAUNCHER), *argv],
+            env=env,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        self.output = bytearray()
+        self._exit_code: int | None = None
+        self._first_line: queue.Queue[str] = queue.Queue()
+        threading.Thread(target=self._read_launcher, daemon=True).start()
+        try:
+            first = self._first_line.get(timeout=PIPED_LAUNCHER_TIMEOUT_SECONDS)
+        except queue.Empty:
+            self._launcher.kill()
+            raise RuntimeError("the launcher did not report a PID") from None
+        if not first.isdigit():
+            self._launcher.kill()
+            raise RuntimeError(f"the launcher failed: {first}")
+        self.pid = int(first)
+
+    def _read_launcher(self) -> None:
+        assert self._launcher.stdout is not None
+        for index, line in enumerate(self._launcher.stdout):
+            if index == 0:
+                self._first_line.put(line.strip())
+                continue
+            parts = line.split()
+            if parts[:1] == ["exit"]:
+                code_or_signal = parts[1] if len(parts) > 1 else ""
+                if code_or_signal.isdigit():
+                    self._exit_code = int(code_or_signal)
+                else:
+                    self._exit_code = -int(getattr(signal.Signals, code_or_signal, 1))
+
+    def write(self, _text: str) -> None:
+        pass
+
+    def poll(self) -> int | None:
+        return self._exit_code
+
+    def force_close(self) -> None:
+        """Test cleanup only."""
+        if psutil.pid_exists(self.pid):
+            try:
+                psutil.Process(self.pid).kill()
+            except psutil.Error:
+                pass
+        self._launcher.kill()
+        self._launcher.wait()
+
+
+Launched = _UnixPty | _WindowsPty | _WindowsConsole | _Piped
+
+
 @dataclass
 class Session:
     pid: int
     config_dir: Path
     record_path: Path  # config_dir / "sessions" / f"{pid}.json"
     seconds_to_record: float = 0.0
-    _launched: _UnixPty | _WindowsPty | _WindowsConsole | None = field(default=None, repr=False)
+    _launched: Launched | None = field(default=None, repr=False)
     _directories: list[Path] = field(default_factory=list, repr=False)
 
     def record(self) -> dict | None:
@@ -301,11 +382,13 @@ def session_env(config_dir: Path) -> dict[str, str]:
     return env
 
 
-def launch(mode: Mode, argv: list[str], env: dict[str, str], cwd: Path) -> _UnixPty | _WindowsPty | _WindowsConsole:
+def launch(mode: Mode, argv: list[str], env: dict[str, str], cwd: Path) -> Launched:
     if mode == "pty":
         return _WindowsPty(argv, env, cwd) if sys.platform == "win32" else _UnixPty(argv, env, cwd)
     if mode == "console" and sys.platform == "win32":
         return _WindowsConsole(argv, env, cwd)
+    if mode == "piped":
+        return _Piped(argv, env, cwd)
     raise ValueError(f"launch mode {mode!r} is not available on {sys.platform}")
 
 
@@ -317,7 +400,12 @@ def start_session(mode: Mode) -> Session | None:
     workdir = Path(tempfile.mkdtemp(prefix="reaper-probe-cwd-")).resolve()
     if seed_state:
         seed_config(config_dir, workdir, version)
-    launched = launch(mode, [claude_path()], session_env(config_dir), workdir)
+    env = session_env(config_dir)
+    argv = [claude_path()]
+    if mode == "piped":
+        env["CLAUDE_CODE_ENTRYPOINT"] = "claude-vscode"
+        argv += PIPED_FLAGS
+    launched = launch(mode, argv, env, workdir)
     session = Session(
         pid=launched.pid,
         config_dir=config_dir,
@@ -536,6 +624,116 @@ def p7() -> None:
     finally:
         session.close()
     report("P7", question, observations)
+
+
+STOP_TIMEOUT_SECONDS = 10
+RECORD_REMOVAL_SECONDS = 2
+CTRL_C_HELPER = Path(__file__).with_name("ctrl_c.py")
+
+
+def run_ctrl_c(*arguments: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run([sys.executable, str(CTRL_C_HELPER), *arguments], capture_output=True, text=True, timeout=30)
+
+
+def console_sharers(pid: int) -> list[int] | str:
+    """Windows: IDs of the processes attached to the session's console, or why they could not be listed."""
+    result = run_ctrl_c("--list", str(pid))
+    return json.loads(result.stdout) if result.returncode == 0 else f"could not attach: {result.stdout.strip()}"
+
+
+def send_ctrl_c(session: Session) -> dict[str, object]:
+    result = run_ctrl_c(str(session.pid))
+    observations: dict[str, object] = {"ctrl_c.py exit code": result.returncode}
+    if result.stdout.strip():
+        observations["ctrl_c.py output"] = result.stdout.strip()
+    return observations
+
+
+def send_sigterm(session: Session) -> dict[str, object]:
+    os.kill(session.pid, signal.SIGTERM)
+    return {}
+
+
+def observe_stop(session: Session, request_stop: Callable[[Session], dict[str, object]]) -> dict[str, object]:
+    """Sends the system's stop request and records the four observations every stop probe reports."""
+    sharers: list[int] | str | None = console_sharers(session.pid) if sys.platform == "win32" else None
+    started = time.monotonic()
+    observations = request_stop(session)
+    while session.exit_code() is None and time.monotonic() - started < STOP_TIMEOUT_SECONDS:
+        time.sleep(0.1)
+    exited = session.exit_code() is not None
+    observations["exited within 10 s"] = f"yes, after {time.monotonic() - started:.1f} s" if exited else "no"
+    observations["exit code"] = session.exit_code()
+    removal_deadline = time.monotonic() + RECORD_REMOVAL_SECONDS
+    while session.record_path.exists() and time.monotonic() < removal_deadline:
+        time.sleep(0.1)
+    observations["session record removed"] = not session.record_path.exists()
+    if isinstance(sharers, str):
+        observations["other processes on its console"] = sharers
+    elif sharers is not None:
+        others = [other for other in sharers if other != session.pid]
+        alive = []
+        for other in others:
+            try:
+                alive.append(f"{psutil.Process(other).name()} ({other})")
+            except psutil.Error:
+                pass
+        observations["other processes on its console"] = f"{len(others)} before the request"
+        observations["of those, still alive afterwards"] = alive or "none"
+    return observations
+
+
+def stop_probe(name: str, question: str, mode: Mode, request_stop: Callable[[Session], dict[str, object]]) -> None:
+    session = start_session(mode)
+    if session is None:
+        report(name, question, {"session": "did not start", "process exit code": last_start_failure.get("exit_code")})
+        return
+    try:
+        record = session.record() or {}
+        observations: dict[str, object] = {
+            "launch mode": mode,
+            "session record": f"appeared after {session.seconds_to_record:.1f} s",
+            "kind": record.get("kind", "<absent>"),
+            "entrypoint": record.get("entrypoint", "<absent>"),
+        }
+        if mode == "piped":
+            observations["flags passed"] = PIPED_FLAGS
+            observations["environment imitated"] = "CLAUDE_CODE_ENTRYPOINT=claude-vscode"
+        wait_for_status(session, "idle", IDLE_TIMEOUT_SECONDS)
+        observations.update(observe_stop(session, request_stop))
+    finally:
+        session.close()
+    report(name, question, observations)
+
+
+@probe
+def p3() -> None:
+    if sys.platform == "win32":
+        return
+    stop_probe("P3", "Does SIGTERM end the session cleanly (process exits, record removed)?", "pty", send_sigterm)
+
+
+@probe
+def p4() -> None:
+    if sys.platform != "win32":
+        return
+    for mode in ("console", "pty"):
+        stop_probe(
+            f"P4 ({mode})",
+            "Does the Ctrl+C sequence (FreeConsole, AttachConsole, SetConsoleCtrlHandler, GenerateConsoleCtrlEvent) end the session cleanly?",
+            mode,
+            send_ctrl_c,
+        )
+
+
+@probe
+def p5() -> None:
+    stop_probe(
+        "P5",
+        "Does a session spawned over pipes with no terminal, as the VS Code extension does, have a console, and does the stop request end it cleanly?",
+        "piped",
+        send_ctrl_c if sys.platform == "win32" else send_sigterm,
+    )
 
 
 def main() -> int:
