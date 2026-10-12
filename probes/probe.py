@@ -45,6 +45,14 @@ TERMINAL_CODE_PATTERN = re.compile(
 )
 EMAIL_PATTERN = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
 IDENTITY_LINE_PATTERN = re.compile(r"welcome|organi[sz]ation", re.IGNORECASE)
+# Wording of first-run dialogs and error screens. Strict mode keeps only lines that use it, because
+# the main screen shows account details that no list of patterns can be sure to catch.
+DIALOG_LINE_PATTERN = re.compile(
+    r"\b(?:trust|folder|theme|style|log ?in|sign in|onboarding|press|continue|select|choose|"
+    r"connect|network|proxy|error|failed|unable|update|terminal|permission|api key|dialog)\b|\?",
+    re.IGNORECASE,
+)
+ACCOUNT_SEPARATOR_PATTERN = re.compile(r"[@·•|]")
 
 Mode = Literal["pty", "console", "piped"]
 
@@ -78,14 +86,23 @@ def _plain_lines(text: str) -> list[str]:
     return lines
 
 
-def redact(text: str) -> str:
-    """Terminal output as plain lines, with identifying lines replaced by <redacted>."""
+def redact(text: str, strict: bool | None = None) -> str:
+    """Terminal output as plain lines, with identifying lines replaced by <redacted>.
+
+    Strict mode, the default while a token is in use, keeps only lines worded like a dialog or an error.
+    """
+    if strict is None:
+        strict = bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"))
     lines: list[str] = []
     for line in _plain_lines(text):
         line = line.strip()
         if not line:
             continue
-        line = "<redacted>" if IDENTITY_LINE_PATTERN.search(line) else EMAIL_PATTERN.sub("<redacted>", line)
+        looks_like_dialog = DIALOG_LINE_PATTERN.search(line) and not ACCOUNT_SEPARATOR_PATTERN.search(line)
+        if IDENTITY_LINE_PATTERN.search(line) or (strict and not looks_like_dialog):
+            line = "<redacted>"
+        else:
+            line = EMAIL_PATTERN.sub("<redacted>", line)
         if not lines or lines[-1] != line:
             lines.append(line)
     return "\n".join(lines)
