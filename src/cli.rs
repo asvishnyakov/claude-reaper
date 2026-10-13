@@ -430,6 +430,7 @@ mod tests {
             .env("CLAUDE_CONFIG_DIR", dir.path())
             .spawn()
             .unwrap();
+        process::wait_for_environment(child.id());
         let session = fixture_for(child.id(), Some("fixture"), None);
         // The record lives in the directory the process names.
         fs::rename(session.path().join("sessions"), dir.path().join("sessions")).unwrap();

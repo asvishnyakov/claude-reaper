@@ -10,6 +10,8 @@ pub enum Identity {
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use linux::wait_for_environment;
 #[cfg(target_os = "linux")]
 pub use linux::{identity, names_config_dir, running_config_dirs};
 

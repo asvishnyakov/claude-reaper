@@ -78,6 +78,20 @@ fn config_dir_in(environ: &[u8]) -> Option<PathBuf> {
         .filter(|path| path.is_absolute())
 }
 
+/// Waits until a freshly spawned process has finished `exec`. A spawn returns while the kernel can
+/// still show the new process an empty environment, so a test that reads it at once is racy.
+#[cfg(test)]
+pub(crate) fn wait_for_environment(pid: u32) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while fs::read(format!("/proc/{pid}/environ")).is_ok_and(|environ| environ.is_empty()) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the environment of {pid} never became visible"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -132,7 +146,9 @@ mod tests {
         if let Some(config_dir) = config_dir {
             command.env("CLAUDE_CONFIG_DIR", config_dir);
         }
-        command.spawn().unwrap()
+        let child = command.spawn().unwrap();
+        wait_for_environment(child.id());
+        child
     }
 
     fn names_config_dir_for(started_with: Option<&Path>, asked_about: &Path) -> bool {
@@ -193,6 +209,7 @@ mod tests {
             .env("CLAUDE_CONFIG_DIR", dir.path())
             .spawn()
             .unwrap();
+        wait_for_environment(child.id());
 
         let found = running_config_dirs();
 
@@ -213,6 +230,8 @@ mod tests {
             .env("CLAUDE_CONFIG_DIR", "")
             .spawn()
             .unwrap();
+        wait_for_environment(relative.id());
+        wait_for_environment(empty.id());
 
         let found = running_config_dirs();
 
