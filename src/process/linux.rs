@@ -3,9 +3,10 @@ use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::Identity;
+use crate::sessions::canonical;
 
 /// Process state and start time (field 22, in clock ticks) from the text of `/proc/<pid>/stat`.
 /// Fields are counted after the last `)`, so a command name with spaces or `)` cannot shift them.
@@ -59,6 +60,15 @@ pub fn running_config_dirs() -> Vec<PathBuf> {
     dirs.into_iter().collect()
 }
 
+/// True when the process's own environment names `config_dir` as its `CLAUDE_CONFIG_DIR`, however
+/// either is spelled. A session that Claude Code started under that directory always does.
+pub fn names_config_dir(pid: u32, config_dir: &Path) -> bool {
+    fs::read(format!("/proc/{pid}/environ"))
+        .ok()
+        .and_then(|environ| config_dir_in(&environ))
+        .is_some_and(|named| canonical(&named) == canonical(config_dir))
+}
+
 /// The absolute `CLAUDE_CONFIG_DIR` in a NUL-separated process environment, if there is one.
 fn config_dir_in(environ: &[u8]) -> Option<PathBuf> {
     environ
@@ -70,6 +80,7 @@ fn config_dir_in(environ: &[u8]) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::process::Command;
 
     use super::*;
@@ -113,6 +124,57 @@ mod tests {
         };
 
         assert_eq!(identity(pid, None), Identity::Different);
+    }
+
+    fn sleeper_with_config_dir(config_dir: Option<&Path>) -> std::process::Child {
+        let mut command = Command::new("sleep");
+        command.arg("30").env_remove("CLAUDE_CONFIG_DIR");
+        if let Some(config_dir) = config_dir {
+            command.env("CLAUDE_CONFIG_DIR", config_dir);
+        }
+        command.spawn().unwrap()
+    }
+
+    fn names_config_dir_for(started_with: Option<&Path>, asked_about: &Path) -> bool {
+        let mut child = sleeper_with_config_dir(started_with);
+        let names = names_config_dir(child.id(), asked_about);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        names
+    }
+
+    #[test]
+    fn process_names_the_config_dir_it_was_started_with() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert!(names_config_dir_for(Some(dir.path()), dir.path()));
+    }
+
+    #[test]
+    fn process_does_not_name_a_different_config_dir() {
+        let started_with = tempfile::tempdir().unwrap();
+        let asked_about = tempfile::tempdir().unwrap();
+
+        assert!(!names_config_dir_for(
+            Some(started_with.path()),
+            asked_about.path()
+        ));
+    }
+
+    #[test]
+    fn process_without_the_variable_names_no_config_dir() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert!(!names_config_dir_for(None, dir.path()));
+    }
+
+    #[test]
+    fn another_spelling_of_the_same_directory_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+
+        assert!(names_config_dir_for(Some(&link), dir.path()));
     }
 
     #[test]

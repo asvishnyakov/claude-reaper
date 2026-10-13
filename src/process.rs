@@ -11,9 +11,9 @@ pub enum Identity {
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
-pub use linux::{identity, running_config_dirs};
+pub use linux::{identity, names_config_dir, running_config_dirs};
 
 #[cfg(not(target_os = "linux"))]
 mod unverified;
 #[cfg(not(target_os = "linux"))]
-pub use unverified::{identity, running_config_dirs};
+pub use unverified::{identity, names_config_dir, running_config_dirs};

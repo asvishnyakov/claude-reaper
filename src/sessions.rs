@@ -30,16 +30,19 @@ struct RecordFile {
     proc_start: Option<String>,
 }
 
+/// The path with symlinks and trailing separators resolved, so two spellings of one directory compare
+/// equal; the path itself when it cannot be resolved.
+pub fn canonical(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// Keeps directories that contain `sessions/`, once each, in first-seen order.
 pub fn session_config_dirs(candidates: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
     let mut seen = HashSet::new();
     candidates
         .into_iter()
         .filter(|candidate| candidate.join("sessions").is_dir())
-        .filter(|candidate| {
-            let identity = fs::canonicalize(candidate).unwrap_or_else(|_| candidate.clone());
-            seen.insert(identity)
-        })
+        .filter(|candidate| seen.insert(canonical(candidate)))
         .collect()
 }
 

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -6,8 +7,8 @@ use chrono::{DateTime, Local};
 use clap::{Args, Parser, Subcommand};
 
 use crate::process::{self, Identity};
-use crate::reaper::{Decision, decide};
-use crate::sessions::{SessionRecord, read_records, session_config_dirs};
+use crate::reaper::{Decision, decide, still_stoppable};
+use crate::sessions::{SessionRecord, canonical, read_records, session_config_dirs};
 use crate::stop::{self, StopOutcome};
 
 #[derive(Debug, Parser)]
@@ -64,16 +65,30 @@ pub fn main() -> ExitCode {
     }
 }
 
-/// The config directories to sweep: `~/.claude`, those of running processes, then those given with
-/// `--config-dir`; each only if it holds `sessions/`, and once.
+/// Where a config directory came from, which decides how far its records are trusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// `~/.claude` or a `--config-dir`: the user named it.
+    Named,
+    /// Found in another process's environment, which anything running as this user could have set.
+    Discovered,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigDir {
+    pub path: PathBuf,
+    pub origin: Origin,
+}
+
+/// The config directories to sweep, each only if it holds `sessions/`, and once: `~/.claude` and
+/// those given with `--config-dir` (named), then those of running processes that are not also named.
 pub fn config_dirs(
     home: &Path,
     discovered: Vec<PathBuf>,
     flagged: &[PathBuf],
     warnings: &mut impl Write,
-) -> Vec<PathBuf> {
+) -> Vec<ConfigDir> {
     let mut candidates = vec![home.join(".claude")];
-    candidates.extend(discovered);
     for path in flagged {
         if path.is_dir() {
             candidates.push(path.clone());
@@ -85,20 +100,30 @@ pub fn config_dirs(
             );
         }
     }
-    session_config_dirs(candidates)
+    let named = session_config_dirs(candidates);
+    let named_identities: HashSet<PathBuf> = named.iter().map(|path| canonical(path)).collect();
+    let discovered = session_config_dirs(discovered)
+        .into_iter()
+        .filter(|path| !named_identities.contains(&canonical(path)));
+    let with_origin = |origin| move |path| ConfigDir { path, origin };
+    named
+        .into_iter()
+        .map(with_origin(Origin::Named))
+        .chain(discovered.map(with_origin(Origin::Discovered)))
+        .collect()
 }
 
 /// Stops (or, with `dry_run`, reports) every session of `config_dirs` that `decide` selects,
 /// one line per session.
 pub fn sweep(
-    config_dirs: &[PathBuf],
+    config_dirs: &[ConfigDir],
     now: DateTime<Local>,
     idle_minutes: u64,
     dry_run: bool,
     output: &mut impl Write,
 ) -> io::Result<()> {
     for config_dir in config_dirs {
-        let records = read_records(config_dir);
+        let records = read_records(&config_dir.path);
         for decision in decide(&records, now, idle_minutes) {
             match decision {
                 Decision::Skip { record, reason } => {
@@ -106,8 +131,18 @@ pub fn sweep(
                 }
                 Decision::Stop {
                     record,
-                    idle_minutes,
-                } => stop_session(record, idle_minutes, dry_run, output)?,
+                    idle_minutes: idle_for_minutes,
+                } if still_stoppable(record, now, idle_minutes) => {
+                    stop_session(record, config_dir.origin, idle_for_minutes, dry_run, output)?;
+                }
+                Decision::Stop { record, .. } => {
+                    writeln!(
+                        output,
+                        "skip {} ({}): changed since it was checked",
+                        record.pid,
+                        name(record)
+                    )?;
+                }
             }
         }
     }
@@ -116,6 +151,7 @@ pub fn sweep(
 
 fn stop_session(
     record: &SessionRecord,
+    origin: Origin,
     idle_minutes: i64,
     dry_run: bool,
     output: &mut impl Write,
@@ -134,6 +170,14 @@ fn stop_session(
         Identity::Gone => skip("process already gone"),
         Identity::Different => skip("PID reused by another process"),
         Identity::Unverified => skip("process identity unverified"),
+        // A directory found through another process's environment may have been planted, with
+        // records naming any PID. Only a process that itself names the directory is acted on.
+        Identity::Same
+            if origin == Origin::Discovered
+                && !process::names_config_dir(pid, &record.config_dir) =>
+        {
+            skip("process does not name this config directory")
+        }
         Identity::Same if dry_run => format!("would stop {label}"),
         Identity::Same => match stop::stop(pid, proc_start, stop::GRACE) {
             Ok(StopOutcome::Stopped) => format!("stopped {label}"),
@@ -186,9 +230,13 @@ mod tests {
 
     /// A config directory holding one record for this test process: interactive, idle 20 minutes.
     fn fixture(name: Option<&str>, proc_start: Option<&str>) -> tempfile::TempDir {
+        fixture_for(std::process::id(), name, proc_start)
+    }
+
+    fn fixture_for(pid: u32, name: Option<&str>, proc_start: Option<&str>) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let mut record = serde_json::json!({
-            "pid": std::process::id(),
+            "pid": pid,
             "sessionId": "s1",
             "kind": "interactive",
             "status": "idle",
@@ -200,25 +248,31 @@ mod tests {
         if let Some(proc_start) = proc_start {
             record["procStart"] = serde_json::json!(proc_start);
         }
-        let path = dir
-            .path()
-            .join(format!("sessions/{}.json", std::process::id()));
+        let path = dir.path().join(format!("sessions/{pid}.json"));
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, record.to_string()).unwrap();
         dir
     }
 
-    fn dry_run_output(config_dir: &Path) -> String {
+    fn named(path: &Path) -> ConfigDir {
+        ConfigDir {
+            path: path.to_path_buf(),
+            origin: Origin::Named,
+        }
+    }
+
+    fn paths(dirs: &[ConfigDir]) -> Vec<PathBuf> {
+        dirs.iter().map(|dir| dir.path.clone()).collect()
+    }
+
+    fn dry_run_output_for(dirs: &[ConfigDir]) -> String {
         let mut output = Vec::new();
-        sweep(
-            &[config_dir.to_path_buf()],
-            Local::now(),
-            15,
-            true,
-            &mut output,
-        )
-        .unwrap();
+        sweep(dirs, Local::now(), 15, true, &mut output).unwrap();
         String::from_utf8(output).unwrap()
+    }
+
+    fn dry_run_output(config_dir: &Path) -> String {
+        dry_run_output_for(&[named(config_dir)])
     }
 
     #[cfg(target_os = "linux")]
@@ -233,7 +287,7 @@ mod tests {
 
         let dirs = config_dirs(home.path(), vec![], &[], &mut io::sink());
 
-        assert_eq!(dirs, [home.path().join(".claude")]);
+        assert_eq!(dirs, [named(&home.path().join(".claude"))]);
     }
 
     #[test]
@@ -243,7 +297,7 @@ mod tests {
 
         let dirs = config_dirs(home.path(), vec![], &[], &mut io::sink());
 
-        assert_eq!(dirs, Vec::<PathBuf>::new());
+        assert!(dirs.is_empty());
     }
 
     #[test]
@@ -259,7 +313,29 @@ mod tests {
             &mut io::sink(),
         );
 
-        assert_eq!(dirs, [profile.path().to_path_buf()]);
+        assert_eq!(dirs, [named(profile.path())]);
+    }
+
+    #[test]
+    fn directory_found_only_through_discovery_is_marked_discovered() {
+        let home = tempfile::tempdir().unwrap();
+        let profile = tempfile::tempdir().unwrap();
+        fs::create_dir_all(profile.path().join("sessions")).unwrap();
+
+        let dirs = config_dirs(
+            home.path(),
+            vec![profile.path().to_path_buf()],
+            &[],
+            &mut io::sink(),
+        );
+
+        assert_eq!(
+            dirs,
+            [ConfigDir {
+                path: profile.path().to_path_buf(),
+                origin: Origin::Discovered
+            }]
+        );
     }
 
     #[test]
@@ -276,7 +352,7 @@ mod tests {
             &mut warnings,
         );
 
-        assert_eq!(dirs, [home.path().join(".claude")]);
+        assert_eq!(paths(&dirs), [home.path().join(".claude")]);
         assert_eq!(
             String::from_utf8(warnings).unwrap(),
             format!(
@@ -326,6 +402,51 @@ mod tests {
         let output = dry_run_output(dir.path());
 
         let expected = format!("skip {pid} (fixture): PID reused by another process");
+        assert!(output.contains(&expected), "{output}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn discovered_directory_is_skipped_when_the_session_process_does_not_name_it() {
+        let dir = fixture(Some("fixture"), None);
+        let discovered = ConfigDir {
+            path: dir.path().to_path_buf(),
+            origin: Origin::Discovered,
+        };
+        let pid = std::process::id();
+
+        let output = dry_run_output_for(&[discovered]);
+
+        let expected = format!("skip {pid} (fixture): process does not name this config directory");
+        assert!(output.contains(&expected), "{output}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn discovered_directory_is_acted_on_when_the_session_process_names_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .env("CLAUDE_CONFIG_DIR", dir.path())
+            .spawn()
+            .unwrap();
+        let session = fixture_for(child.id(), Some("fixture"), None);
+        // The record lives in the directory the process names.
+        fs::rename(session.path().join("sessions"), dir.path().join("sessions")).unwrap();
+        let discovered = ConfigDir {
+            path: dir.path().to_path_buf(),
+            origin: Origin::Discovered,
+        };
+
+        let output = dry_run_output_for(&[discovered]);
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let expected = format!(
+            "would stop {} (fixture, {}, idle 20 min)",
+            child.id(),
+            dir_name(dir.path())
+        );
         assert!(output.contains(&expected), "{output}");
     }
 

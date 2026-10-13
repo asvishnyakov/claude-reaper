@@ -1,6 +1,6 @@
 use chrono::{DateTime, Local};
 
-use crate::sessions::{SessionRecord, find_transcript};
+use crate::sessions::{SessionRecord, find_transcript, read_records};
 use crate::transcript::has_pending_schedule;
 
 const MINUTE_MS: i64 = 60_000;
@@ -31,6 +31,22 @@ pub fn decide(
         .iter()
         .filter_map(|record| decide_one(record, now, threshold_ms))
         .collect()
+}
+
+/// Decides again from the record file as it is now. A sweep decides for every session first and then
+/// stops them one at a time, so a decision can be seconds old when its turn comes: the user may have
+/// come back to that session in between.
+pub fn still_stoppable(record: &SessionRecord, now: DateTime<Local>, idle_minutes: u64) -> bool {
+    let current = read_records(&record.config_dir)
+        .into_iter()
+        .find(|candidate| candidate.pid == record.pid);
+    current.is_some_and(|current| {
+        let current = [current];
+        matches!(
+            decide(&current, now, idle_minutes).as_slice(),
+            [Decision::Stop { .. }]
+        )
+    })
 }
 
 fn decide_one(
@@ -222,6 +238,51 @@ mod tests {
             panic!("expected one skip, got {decisions:?}");
         };
         assert!(reason.starts_with("transcript unreadable: "), "{reason}");
+    }
+
+    /// The record file as it is on disk now, for a session `decide` saw earlier as `record(dir, 20)`.
+    fn write_record_file(config_dir: &Path, status: &str, idle_minutes: i64) {
+        let path = config_dir.join("sessions/100.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let record = serde_json::json!({
+            "pid": 100,
+            "sessionId": "s1",
+            "kind": "interactive",
+            "status": status,
+            "statusUpdatedAt": now().timestamp_millis() - idle_minutes * 60_000,
+        });
+        fs::write(path, record.to_string()).unwrap();
+    }
+
+    #[test]
+    fn unchanged_record_is_still_stoppable() {
+        let dir = tempfile::tempdir().unwrap();
+        write_record_file(dir.path(), "idle", 20);
+
+        assert!(still_stoppable(&record(dir.path(), 20), now(), 15));
+    }
+
+    #[test]
+    fn record_that_became_busy_is_not_stoppable() {
+        let dir = tempfile::tempdir().unwrap();
+        write_record_file(dir.path(), "busy", 20);
+
+        assert!(!still_stoppable(&record(dir.path(), 20), now(), 15));
+    }
+
+    #[test]
+    fn record_updated_since_is_not_stoppable() {
+        let dir = tempfile::tempdir().unwrap();
+        write_record_file(dir.path(), "idle", 0);
+
+        assert!(!still_stoppable(&record(dir.path(), 20), now(), 15));
+    }
+
+    #[test]
+    fn record_that_vanished_is_not_stoppable() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert!(!still_stoppable(&record(dir.path(), 20), now(), 15));
     }
 
     #[test]
