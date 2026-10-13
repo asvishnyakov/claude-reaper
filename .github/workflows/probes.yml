@@ -46,7 +46,8 @@ jobs:
       - name: Run probes
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-        run: uv run --locked probes/probe.py --os ${{ matrix.label }}
+        # --no-build: only hash-locked wheels run here; a source build would fetch an unpinned build backend.
+        run: uv run --locked --no-build probes/probe.py --os ${{ matrix.label }}
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:

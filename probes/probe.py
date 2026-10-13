@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.12"
+# requires-python = ">=3.12,<3.15"
 # dependencies = ["psutil", "pywinpty; sys_platform == 'win32'"]
 # ///
 """Probes that record how Claude Code behaves on each operating system.
@@ -45,18 +45,25 @@ TERMINAL_CODE_PATTERN = re.compile(
     r"|\x1b\[(?P<row>\d*);?(?P<at_column>\d*)[Hf]"  # cursor to row and column: starts a new line
     r"|\x1b\[[0-?]*[ -/]*[@-~]"  # other CSI sequences
     r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC sequences
+    r"|\x1b[()*+][0-9A-Za-z]"  # character set selection
+    r"|\x1b[0-9=>]"  # save and restore cursor, keypad modes
     r"|\x1b[@-Z\\-_]"  # two-character sequences
 )
 EMAIL_PATTERN = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
 IDENTITY_LINE_PATTERN = re.compile(r"welcome|organi[sz]ation", re.IGNORECASE)
-# Wording of first-run dialogs and error screens. Strict mode keeps only lines that use it, because
-# the main screen shows account details that no list of patterns can be sure to catch.
-DIALOG_LINE_PATTERN = re.compile(
-    r"\b(?:trust|folder|theme|style|log ?in|sign in|onboarding|press|continue|select|choose|"
-    r"connect|network|proxy|error|failed|unable|update|terminal|permission|api key|dialog)\b",
-    re.IGNORECASE,
-)
-ACCOUNT_SEPARATOR_PATTERN = re.compile(r"[@·•|]")
+# Screens that can be recognised by their wording. In strict mode only these labels are printed, never
+# the text itself: the main screen shows account details that no list of patterns can be sure to catch,
+# so nothing that was on the screen may reach a log or an artifact.
+KNOWN_SCREENS = {
+    "folder trust dialog": re.compile(r"do you trust|trust the files|trust this folder", re.IGNORECASE),
+    "login prompt": re.compile(r"log ?in method|please log ?in|sign in|not logged in|run /login", re.IGNORECASE),
+    "theme or onboarding": re.compile(r"text style|choose .*theme|let's get started|onboarding", re.IGNORECASE),
+    "network error": re.compile(r"unable to connect|proxy|check your internet connection", re.IGNORECASE),
+    "update notice": re.compile(r"update available|auto-?update|new version", re.IGNORECASE),
+    "API key prompt": re.compile(r"api key", re.IGNORECASE),
+    "permission dialog": re.compile(r"do you want to|permission", re.IGNORECASE),
+}
+CONTROL_CHARACTER_PATTERN = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 
 Mode = Literal["pty", "console", "piped"]
 
@@ -93,20 +100,19 @@ def _plain_lines(text: str) -> list[str]:
 def redact(text: str, strict: bool | None = None) -> str:
     """Terminal output as plain lines, with identifying lines replaced by <redacted>.
 
-    Strict mode, the default while a token is in use, keeps only lines worded like a dialog or an error.
+    Strict mode, the default while a token is in use, prints no screen text at all: only how many
+    lines there were and which known screens they matched. A session with an account can show its
+    name anywhere on screen, so no filter of the text itself is trusted.
     """
     if strict is None:
         strict = bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"))
+    screen = [line for line in (CONTROL_CHARACTER_PATTERN.sub("", line).strip() for line in _plain_lines(text)) if line]
+    if strict:
+        recognised = [label for label, pattern in KNOWN_SCREENS.items() if any(pattern.search(line) for line in screen)]
+        return f"<screen text withheld while a token is in use; {len(screen)} lines; recognised: {', '.join(recognised) or 'nothing'}>"
     lines: list[str] = []
-    for line in _plain_lines(text):
-        line = line.strip()
-        if not line:
-            continue
-        looks_like_dialog = DIALOG_LINE_PATTERN.search(line) and not ACCOUNT_SEPARATOR_PATTERN.search(line)
-        if IDENTITY_LINE_PATTERN.search(line) or (strict and not looks_like_dialog):
-            line = "<redacted>"
-        else:
-            line = EMAIL_PATTERN.sub("<redacted>", line)
+    for line in screen:
+        line = "<redacted>" if IDENTITY_LINE_PATTERN.search(line) else EMAIL_PATTERN.sub("<redacted>", line)
         if not lines or lines[-1] != line:
             lines.append(line)
     return "\n".join(lines)
@@ -274,6 +280,12 @@ class _Piped:
             self._launcher.kill()
             raise RuntimeError(f"the launcher failed: {first}")
         self.pid = int(first)
+        # Remembers the process by its start time as well as its PID, so cleanup can tell if the PID was reused.
+        self._process: psutil.Process | None
+        try:
+            self._process = psutil.Process(self.pid)
+        except psutil.Error:
+            self._process = None
 
     def _read_launcher(self) -> None:
         assert self._launcher.stdout is not None
@@ -296,10 +308,11 @@ class _Piped:
         return self._exit_code
 
     def force_close(self) -> None:
-        """Test cleanup only."""
-        if psutil.pid_exists(self.pid):
+        """Test cleanup only. Never touches a process other than the one the launcher started."""
+        session_may_be_alive = self._exit_code is None and self._process is not None
+        if session_may_be_alive and self._process.is_running():  # type: ignore[union-attr]
             try:
-                psutil.Process(self.pid).kill()
+                self._process.kill()  # type: ignore[union-attr]
             except psutil.Error:
                 pass
         self._launcher.kill()
@@ -942,7 +955,8 @@ def main() -> int:
         try:
             succeeded = function() is not False
         except Exception:
-            report(function.__name__.upper(), "probe raised an exception", {"traceback": redact(traceback.format_exc())})
+            # A traceback holds no screen text, so only the emails are masked and it stays readable.
+            report(function.__name__.upper(), "probe raised an exception", {"traceback": redact(traceback.format_exc(), strict=False)})
             succeeded = False
         if function is p1 and not succeeded:
             p1_failed = True
