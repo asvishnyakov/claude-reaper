@@ -1,0 +1,41 @@
+name: Install Claude Code
+description: Installs one pinned Claude Code version with the official installer, puts it on PATH and turns off auto-updates.
+
+inputs:
+  version:
+    description: Claude Code version to install. Probe results and the integration check are recorded against it.
+    default: '2.1.310'
+
+runs:
+  using: composite
+  steps:
+    - name: Install Claude Code
+      if: runner.os != 'Windows'
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+      run: |
+        curl -fsSL https://claude.ai/install.sh | bash -s "$VERSION"
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+    - name: Install Claude Code
+      if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        VERSION: ${{ inputs.version }}
+      run: |
+        & ([scriptblock]::Create((irm https://claude.ai/install.ps1))) $env:VERSION
+        "$env:USERPROFILE\.local\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+    - name: Turn off auto-updates
+      shell: bash
+      run: echo "DISABLE_AUTOUPDATER=1" >> "$GITHUB_ENV"
+    - name: Check the installed version
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+      run: |
+        installed="$(claude --version)"
+        echo "$installed"
+        case "$installed" in
+          *"$VERSION (Claude Code)"*) ;;
+          *) echo "expected Claude Code $VERSION" >&2; exit 1 ;;
+        esac

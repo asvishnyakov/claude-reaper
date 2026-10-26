@@ -344,6 +344,13 @@ class Session:
         text = redact(bytes(self._launched.output).decode("utf-8", "replace"))
         return "\n".join(text.split("\n")[-SCREEN_TAIL_LINES:])
 
+    def shows(self, text: str) -> bool:
+        """Whether the terminal drew `text` on one line. Answers yes or no only, so no screen text is printed."""
+        if self._launched is None:
+            return False
+        raw = bytes(self._launched.output).decode("utf-8", "replace")
+        return any(text in line for line in _plain_lines(raw))
+
     def send(self, text: str) -> None:
         """Types into the session's terminal, if it has one."""
         if self._launched is not None:
@@ -682,6 +689,11 @@ def send_sigterm(pid: int) -> dict[str, object]:
     return {}
 
 
+def send_sigint(pid: int) -> dict[str, object]:
+    os.kill(pid, signal.SIGINT)
+    return {}
+
+
 @dataclass
 class StopTarget:
     """What a stop probe needs to know about the process it stops, whether or not it is our child."""
@@ -739,7 +751,14 @@ def observe_stop(target: StopTarget, request_stop: Callable[[int], dict[str, obj
     return observations
 
 
-def stop_probe(name: str, question: str, mode: Mode, request_stop: Callable[[int], dict[str, object]]) -> None:
+def stop_probe(
+    name: str,
+    question: str,
+    mode: Mode,
+    request_stop: Callable[[int], dict[str, object]],
+    draft: str | None = None,
+) -> None:
+    """With `draft`, that text is typed into the idle session's prompt, without Enter, before the stop request."""
     session = start_session(mode)
     if session is None:
         report(name, question, {"session": "did not start", "process exit code": last_start_failure.get("exit_code")})
@@ -747,6 +766,7 @@ def stop_probe(name: str, question: str, mode: Mode, request_stop: Callable[[int
     try:
         record = session.record() or {}
         observations: dict[str, object] = {
+            "Claude Code version": claude_version(),
             "launch mode": mode,
             "session record": f"appeared after {session.seconds_to_record:.1f} s",
             "kind": record.get("kind", "<absent>"),
@@ -756,6 +776,11 @@ def stop_probe(name: str, question: str, mode: Mode, request_stop: Callable[[int
             observations["flags passed"] = PIPED_FLAGS
             observations["environment imitated"] = "CLAUDE_CODE_ENTRYPOINT=claude-vscode"
         wait_for_status(session, "idle", IDLE_TIMEOUT_SECONDS)
+        if draft is not None:
+            session.send(draft)
+            time.sleep(1)
+            observations["unsent text typed"] = "yes"
+            observations["unsent text shown in the prompt"] = session.shows(draft)
         observations.update(observe_stop(stop_target(session), request_stop))
     finally:
         session.close()
@@ -767,6 +792,16 @@ def p3() -> None:
     if sys.platform == "win32":
         return
     stop_probe("P3", "Does SIGTERM end the session cleanly (process exits, record removed)?", "pty", send_sigterm)
+
+
+@probe
+def p3b() -> None:
+    if sys.platform == "win32":
+        return
+    question = "Does SIGINT end an idle session with exit code 0 and remove its record?"
+    stop_probe("P3b (pty)", question, "pty", send_sigint)
+    stop_probe("P3b (pty, unsent text)", question, "pty", send_sigint, draft="draft that was never sent")
+    stop_probe("P3b (piped)", question, "piped", send_sigint)
 
 
 @probe

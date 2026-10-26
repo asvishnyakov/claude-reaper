@@ -5,6 +5,7 @@ Run: uv run --no-project --with psutil python -B -m unittest discover -s probes
 
 import unittest
 import unittest.mock
+from pathlib import Path
 
 import probe
 
@@ -108,6 +109,20 @@ class PipedCleanupTests(unittest.TestCase):
         launched.force_close()
 
         process.kill.assert_called_once()
+
+
+class SessionShowsTests(unittest.TestCase):
+    def session_that_printed(self, output: bytes) -> probe.Session:
+        launched = unittest.mock.Mock(output=bytearray(output))
+        return probe.Session(pid=1, config_dir=Path("c"), record_path=Path("c/sessions/1.json"), _launched=launched)
+
+    def test_finds_text_drawn_with_colours_and_cursor_moves(self) -> None:
+        session = self.session_that_printed(b"\x1b[2G\x1b[38;5;211m> draft\x1b[39m\x1b[1Cthat was typed\r\n")
+
+        self.assertTrue(session.shows("draft that was typed"))
+
+    def test_does_not_find_text_that_was_never_drawn(self) -> None:
+        self.assertFalse(self.session_that_printed(b"> \r\n").shows("draft"))
 
 
 if __name__ == "__main__":
