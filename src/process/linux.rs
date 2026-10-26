@@ -78,12 +78,19 @@ fn config_dir_in(environ: &[u8]) -> Option<PathBuf> {
         .filter(|path| path.is_absolute())
 }
 
-/// Waits until a freshly spawned process has finished `exec`. A spawn returns while the kernel can
-/// still show the new process an empty environment, so a test that reads it at once is racy.
+/// Waits until a freshly spawned process has finished `exec`. A spawn can return while the child is
+/// still a copy of this process, showing this test binary as its executable and this process's
+/// environment, and right after `exec` the kernel can show the new program an empty environment.
+/// A test that reads the environment at once is racy either way.
 #[cfg(test)]
 pub(crate) fn wait_for_environment(pid: u32) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while fs::read(format!("/proc/{pid}/environ")).is_ok_and(|environ| environ.is_empty()) {
+    let this_program = fs::read_link("/proc/self/exe").ok();
+    let exec_pending = || {
+        fs::read_link(format!("/proc/{pid}/exe")).ok() == this_program
+            || fs::read(format!("/proc/{pid}/environ")).is_ok_and(|environ| environ.is_empty())
+    };
+    while exec_pending() {
         assert!(
             std::time::Instant::now() < deadline,
             "the environment of {pid} never became visible"
@@ -149,6 +156,18 @@ mod tests {
         let child = command.spawn().unwrap();
         wait_for_environment(child.id());
         child
+    }
+
+    #[test]
+    fn waiting_for_the_environment_ends_after_exec() {
+        let mut child = sleeper_with_config_dir(None);
+
+        let executable = fs::read_link(format!("/proc/{}/exe", child.id()));
+        let environ = fs::read(format!("/proc/{}/environ", child.id())).unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_ne!(executable.ok(), fs::read_link("/proc/self/exe").ok());
+        assert!(!environ.is_empty());
     }
 
     fn names_config_dir_for(started_with: Option<&Path>, asked_about: &Path) -> bool {
