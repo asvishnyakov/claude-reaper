@@ -125,5 +125,21 @@ class SessionShowsTests(unittest.TestCase):
         self.assertFalse(self.session_that_printed(b"> \r\n").shows("draft"))
 
 
+class IntegrationGuardTests(unittest.TestCase):
+    """The integration check stops every idle session it finds, so it must never run on a developer machine."""
+
+    def test_integration_refuses_to_run_outside_github_actions(self) -> None:
+        with (
+            unittest.mock.patch.dict("os.environ", {}, clear=True),
+            unittest.mock.patch.object(probe, "start_session") as start_session,
+            unittest.mock.patch.object(probe.subprocess, "run") as run,
+        ):
+            result = probe.integration(Path("claude-reaper"))
+
+        self.assertEqual(result, 2)
+        start_session.assert_not_called()
+        run.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

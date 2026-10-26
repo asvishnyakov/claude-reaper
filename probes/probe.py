@@ -959,6 +959,85 @@ def p6() -> None:
     report("P6", question, observations)
 
 
+INTEGRATION_QUESTION = "Does claude-reaper run stop a real idle session, with exit code 0, only for selected entrypoints?"
+
+
+@dataclass
+class Checks:
+    """Pass or fail observations for one integration case; a failure records what was seen instead."""
+
+    observations: dict[str, object] = field(default_factory=dict)
+    failed: bool = False
+
+    def add(self, label: str, passed: bool, seen: object) -> bool:
+        self.observations[label] = "yes" if passed else f"no: {seen}"
+        self.failed |= not passed
+        return passed
+
+
+def reaper_prints(checks: Checks, label: str, reaper: Path, session: Session, flags: list[str], prefix: str, suffix: str = "") -> None:
+    """Runs `claude-reaper run --idle-minutes 0` on the session's config dir and checks for one output line."""
+    command = [str(reaper), "run", "--idle-minutes", "0", "--config-dir", str(session.config_dir), *flags]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=60, check=False)
+    lines = result.stdout.splitlines()
+    matched = any(line.startswith(prefix) and line.endswith(suffix) for line in lines)
+    seen = f"exit status {result.returncode}, output {lines}, errors {result.stderr.strip()!r}"
+    checks.add(label, result.returncode == 0 and matched, seen)
+
+
+def session_ended_cleanly(checks: Checks, session: Session) -> None:
+    deadline = time.monotonic() + STOP_TIMEOUT_SECONDS
+    while session.exit_code() is None and time.monotonic() < deadline:
+        time.sleep(0.1)
+    exit_code = session.exit_code()
+    checks.add(f"exit code 0 within {STOP_TIMEOUT_SECONDS} s", exit_code == 0, f"exit code {exit_code}")
+    deadline = time.monotonic() + RECORD_REMOVAL_SECONDS
+    while session.record_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.1)
+    checks.add("session record removed", not session.record_path.exists(), "the record is still there")
+    checks.add("process gone", not is_running(session.pid), "the process is still running")
+
+
+def integration_case(reaper: Path, name: str, mode: Mode, flags: list[str], unselected_by_default: str | None) -> bool:
+    """`unselected_by_default`: the session's entrypoint when the default selection must skip it."""
+    checks = Checks({"Claude Code version": claude_version(), "launch mode": mode, "flags": flags})
+    session = start_session(mode)
+    if session is None:
+        checks.add("session started", False, f"no record within {RECORD_TIMEOUT_SECONDS} s")
+    else:
+        try:
+            pid = session.pid
+            if checks.add("session idle", wait_for_status(session, "idle", IDLE_TIMEOUT_SECONDS) is not None, f"not idle within {IDLE_TIMEOUT_SECONDS} s"):
+                if unselected_by_default is not None:
+                    reaper_prints(
+                        checks, "dry run with default entrypoints skips it", reaper, session, ["--dry-run"],
+                        f"skip {pid} (", f"): entrypoint {unselected_by_default} not selected",
+                    )
+                reaper_prints(checks, "dry run reports it", reaper, session, [*flags, "--dry-run"], f"would stop {pid} (")
+                reaper_prints(checks, "run reports it stopped", reaper, session, flags, f"stopped {pid} (")
+                session_ended_cleanly(checks, session)
+        finally:
+            session.close()
+    report(f"Integration ({name})", INTEGRATION_QUESTION, checks.observations)
+    return not checks.failed
+
+
+def integration(reaper: Path) -> int:
+    """Stops real sessions with claude-reaper: 0 when every check passed, 1 when one failed, 2 when refused.
+
+    `run --idle-minutes 0` stops every idle session of every profile it finds, the developer's own
+    included, so this runs only on GitHub Actions.
+    """
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        print("refusing to run: the integration check stops sessions and runs only on GitHub Actions", file=sys.stderr)
+        return 2
+    passed = [
+        integration_case(reaper, "VS Code style", "piped", [], None),
+        integration_case(reaper, "terminal", "pty", ["--entrypoint", "cli"], "cli"),
+    ]
+    return 0 if all(passed) else 1
+
+
 def main() -> int:
     global results_label, seed_state
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
@@ -971,13 +1050,14 @@ def main() -> int:
         metavar=("CONFIG_DIR", "PID", "OUT_FILE"),
         help="run by the service manager in P6, not by the workflow",
     )
+    parser.add_argument("--integration", metavar="REAPER", help="instead of the probes, stop real sessions with this claude-reaper binary")
     arguments = parser.parse_args()
     if arguments.service_check:
         config_dir, pid, out_file = arguments.service_check
         return service_check(Path(config_dir), int(pid), Path(out_file))
     if arguments.os_label is None:
         parser.error("--os is required")
-    results_label = arguments.os_label
+    results_label = f"integration-{arguments.os_label}" if arguments.integration else arguments.os_label
     seed_state = not arguments.no_seed
 
     RESULTS_DIR.mkdir(exist_ok=True)
@@ -985,6 +1065,8 @@ def main() -> int:
         f"# Probe results: {results_label}\n\nRunner: {platform.platform()}, Python {platform.python_version()}\n\n",
         encoding="utf-8",
     )
+    if arguments.integration:
+        return integration(Path(arguments.integration))
     p1_failed = False
     for function in PROBES:
         try:
