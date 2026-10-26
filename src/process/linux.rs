@@ -1,0 +1,268 @@
+use std::collections::BTreeSet;
+use std::ffi::OsStr;
+use std::fs;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+
+use super::Identity;
+use crate::sessions::canonical;
+
+/// Process state and start time (field 22, in clock ticks) from the text of `/proc/<pid>/stat`.
+/// Fields are counted after the last `)`, so a command name with spaces or `)` cannot shift them.
+pub(crate) fn parse_start_ticks(stat: &str) -> Option<(char, &str)> {
+    let after_name = &stat[stat.rfind(')')? + 1..];
+    let mut fields = after_name.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    let start_ticks = fields.nth(18)?;
+    Some((state, start_ticks))
+}
+
+pub fn identity(pid: u32, proc_start: Option<&str>) -> Identity {
+    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return Identity::Gone;
+    };
+    match parse_start_ticks(&stat) {
+        None | Some(('Z', _)) => Identity::Gone,
+        Some((_, start_ticks)) => {
+            // A session record can name any PID; only this user's own processes are ever ours to stop.
+            let own_uid = rustix::process::getuid().as_raw();
+            let is_own = fs::metadata(format!("/proc/{pid}"))
+                .is_ok_and(|metadata| metadata.uid() == own_uid);
+            match proc_start {
+                _ if !is_own => Identity::Different,
+                Some(recorded) if recorded != start_ticks => Identity::Different,
+                _ => Identity::Same,
+            }
+        }
+    }
+}
+
+/// Distinct absolute `CLAUDE_CONFIG_DIR` values of this user's running processes, this one included.
+pub fn running_config_dirs() -> Vec<PathBuf> {
+    let uid = rustix::process::getuid().as_raw();
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut dirs = BTreeSet::new();
+    for entry in entries.filter_map(Result::ok) {
+        let is_process = entry.file_name().as_bytes().iter().all(u8::is_ascii_digit);
+        let is_own = entry.metadata().is_ok_and(|metadata| metadata.uid() == uid);
+        if !is_process || !is_own {
+            continue;
+        }
+        if let Ok(environ) = fs::read(entry.path().join("environ"))
+            && let Some(dir) = config_dir_in(&environ)
+        {
+            dirs.insert(dir);
+        }
+    }
+    dirs.into_iter().collect()
+}
+
+/// True when the process's own environment names `config_dir` as its `CLAUDE_CONFIG_DIR`, however
+/// either is spelled. A session that Claude Code started under that directory always does.
+pub fn names_config_dir(pid: u32, config_dir: &Path) -> bool {
+    fs::read(format!("/proc/{pid}/environ"))
+        .ok()
+        .and_then(|environ| config_dir_in(&environ))
+        .is_some_and(|named| canonical(&named) == canonical(config_dir))
+}
+
+/// The absolute `CLAUDE_CONFIG_DIR` in a NUL-separated process environment, if there is one.
+fn config_dir_in(environ: &[u8]) -> Option<PathBuf> {
+    environ
+        .split(|&byte| byte == 0)
+        .find_map(|variable| variable.strip_prefix(b"CLAUDE_CONFIG_DIR="))
+        .map(|value| PathBuf::from(OsStr::from_bytes(value)))
+        .filter(|path| path.is_absolute())
+}
+
+/// Waits until a freshly spawned process has finished `exec`. A spawn can return while the child is
+/// still a copy of this process, showing this test binary as its executable and this process's
+/// environment, and right after `exec` the kernel can show the new program an empty environment.
+/// A test that reads the environment at once is racy either way.
+#[cfg(test)]
+pub(crate) fn wait_for_environment(pid: u32) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let this_program = fs::read_link("/proc/self/exe").ok();
+    let exec_pending = || {
+        fs::read_link(format!("/proc/{pid}/exe")).ok() == this_program
+            || fs::read(format!("/proc/{pid}/environ")).is_ok_and(|environ| environ.is_empty())
+    };
+    while exec_pending() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the environment of {pid} never became visible"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::process::Command;
+
+    use super::*;
+
+    #[test]
+    fn start_ticks_survive_parentheses_in_the_command_name() {
+        let stat =
+            "1234 (a) b) S 1 1234 1234 0 -1 4194304 1 0 0 0 0 0 0 0 20 0 1 0 2202283 1000 100";
+
+        assert_eq!(parse_start_ticks(stat), Some(('S', "2202283")));
+    }
+
+    #[test]
+    fn own_process_without_recorded_start_is_same() {
+        assert_eq!(identity(std::process::id(), None), Identity::Same);
+    }
+
+    #[test]
+    fn own_process_with_a_wrong_start_is_different() {
+        assert_eq!(identity(std::process::id(), Some("1")), Identity::Different);
+    }
+
+    /// A running process that belongs to another user, if this system has one.
+    fn pid_of_another_user() -> Option<u32> {
+        let own_uid = rustix::process::getuid().as_raw();
+        fs::read_dir("/proc")
+            .ok()?
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .metadata()
+                    .is_ok_and(|metadata| metadata.uid() != own_uid)
+            })
+            .find_map(|entry| entry.file_name().to_str()?.parse().ok())
+    }
+
+    #[test]
+    fn process_of_another_user_is_different() {
+        let Some(pid) = pid_of_another_user() else {
+            return;
+        };
+
+        assert_eq!(identity(pid, None), Identity::Different);
+    }
+
+    fn sleeper_with_config_dir(config_dir: Option<&Path>) -> std::process::Child {
+        let mut command = Command::new("sleep");
+        command.arg("30").env_remove("CLAUDE_CONFIG_DIR");
+        if let Some(config_dir) = config_dir {
+            command.env("CLAUDE_CONFIG_DIR", config_dir);
+        }
+        let child = command.spawn().unwrap();
+        wait_for_environment(child.id());
+        child
+    }
+
+    #[test]
+    fn waiting_for_the_environment_ends_after_exec() {
+        let mut child = sleeper_with_config_dir(None);
+
+        let executable = fs::read_link(format!("/proc/{}/exe", child.id()));
+        let environ = fs::read(format!("/proc/{}/environ", child.id())).unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_ne!(executable.ok(), fs::read_link("/proc/self/exe").ok());
+        assert!(!environ.is_empty());
+    }
+
+    fn names_config_dir_for(started_with: Option<&Path>, asked_about: &Path) -> bool {
+        let mut child = sleeper_with_config_dir(started_with);
+        let names = names_config_dir(child.id(), asked_about);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        names
+    }
+
+    #[test]
+    fn process_names_the_config_dir_it_was_started_with() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert!(names_config_dir_for(Some(dir.path()), dir.path()));
+    }
+
+    #[test]
+    fn process_does_not_name_a_different_config_dir() {
+        let started_with = tempfile::tempdir().unwrap();
+        let asked_about = tempfile::tempdir().unwrap();
+
+        assert!(!names_config_dir_for(
+            Some(started_with.path()),
+            asked_about.path()
+        ));
+    }
+
+    #[test]
+    fn process_without_the_variable_names_no_config_dir() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert!(!names_config_dir_for(None, dir.path()));
+    }
+
+    #[test]
+    fn another_spelling_of_the_same_directory_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+
+        assert!(names_config_dir_for(Some(&link), dir.path()));
+    }
+
+    #[test]
+    fn exited_child_is_gone() {
+        let mut child = Command::new("true").spawn().unwrap();
+        child.wait().unwrap();
+
+        assert_eq!(identity(child.id(), None), Identity::Gone);
+    }
+
+    #[test]
+    fn finds_config_dir_of_a_running_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .env("CLAUDE_CONFIG_DIR", dir.path())
+            .spawn()
+            .unwrap();
+        wait_for_environment(child.id());
+
+        let found = running_config_dirs();
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(found.contains(&dir.path().to_path_buf()), "{found:?}");
+    }
+
+    #[test]
+    fn ignores_relative_and_empty_config_dir_values() {
+        let mut relative = Command::new("sleep")
+            .arg("30")
+            .env("CLAUDE_CONFIG_DIR", "relative/unique-marker")
+            .spawn()
+            .unwrap();
+        let mut empty = Command::new("sleep")
+            .arg("30")
+            .env("CLAUDE_CONFIG_DIR", "")
+            .spawn()
+            .unwrap();
+        wait_for_environment(relative.id());
+        wait_for_environment(empty.id());
+
+        let found = running_config_dirs();
+
+        for child in [&mut relative, &mut empty] {
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+        assert!(
+            found
+                .iter()
+                .all(|path| !path.ends_with("unique-marker") && !path.as_os_str().is_empty()),
+            "{found:?}"
+        );
+    }
+}
