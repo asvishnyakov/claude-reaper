@@ -91,3 +91,44 @@ Runner: macOS-26.6.2-arm64-arm-64bit-Mach-O, Python 3.14.7
 ```
 - session exit code seen by the probe afterwards: 143
 
+## Added later: P3b
+
+Added from workflow run 40354834423 (commit `7ce88063cffc96b4181253c10899cda11bf9b1f0`, Claude Code 2.1.310).
+
+### P3b (pty): Does SIGINT end an idle session with exit code 0 and remove its record?
+
+- Claude Code version: 2.1.310 (Claude Code)
+- launch mode: pty
+- session record: appeared after 1.1 s
+- kind: interactive
+- entrypoint: cli
+- exited within 10 s: yes, after 0.8 s
+- exit code: 0
+- session record removed: true
+
+### P3b (pty, unsent text): Does SIGINT end an idle session with exit code 0 and remove its record?
+
+- Claude Code version: 2.1.310 (Claude Code)
+- launch mode: pty
+- session record: appeared after 1.1 s
+- kind: interactive
+- entrypoint: cli
+- unsent text typed: yes
+- unsent text shown in the prompt: true
+- exited within 10 s: yes, after 0.8 s
+- exit code: 0
+- session record removed: true
+
+### P3b (piped): Does SIGINT end an idle session with exit code 0 and remove its record?
+
+- Claude Code version: 2.1.310 (Claude Code)
+- launch mode: piped
+- session record: appeared after 1.1 s
+- kind: interactive
+- entrypoint: claude-vscode
+- flags passed: ["--output-format", "stream-json", "--input-format", "stream-json", "--verbose", "--include-partial-messages", "--replay-user-messages", "--enable-auth-status", "--no-chrome", "--max-thinking-tokens=31999", "--thinking-display=summarized", "--permission-prompt-tool=stdio", "--setting-sources=user,project,local"]
+- environment imitated: CLAUDE_CODE_ENTRYPOINT=claude-vscode
+- exited within 10 s: yes, after 0.5 s
+- exit code: 0
+- session record removed: true
+
