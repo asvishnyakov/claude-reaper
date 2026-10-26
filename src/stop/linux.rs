@@ -10,14 +10,15 @@ use crate::process::{Identity, identity};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Sends `SIGTERM`, which Claude Code answers with its own shutdown routine, then waits up to
-/// `grace` for the process to exit. Never escalates.
+/// Sends `SIGINT`, which Claude Code answers with its own shutdown routine and exit code 0 (a client
+/// such as the VS Code extension reports any other exit as an error), then waits up to `grace` for
+/// the process to exit. Never escalates.
 pub fn stop(pid: u32, proc_start: Option<&str>, grace: Duration) -> io::Result<StopOutcome> {
     let target = i32::try_from(pid)
         .ok()
         .and_then(Pid::from_raw)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid pid {pid}")))?;
-    match kill_process(target, Signal::TERM) {
+    match kill_process(target, Signal::INT) {
         Ok(()) => {}
         Err(Errno::SRCH) => return Ok(StopOutcome::Stopped),
         Err(error) => return Err(error.into()),
@@ -41,13 +42,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn terminates_a_child_and_reports_stopped() {
+    fn interrupts_a_child_and_reports_stopped() {
         let mut child = Command::new("sleep").arg("60").spawn().unwrap();
 
         let outcome = stop(child.id(), None, Duration::from_secs(5));
 
         assert_eq!(outcome.unwrap(), StopOutcome::Stopped);
-        assert_eq!(child.wait().unwrap().signal(), Some(15));
+        assert_eq!(child.wait().unwrap().signal(), Some(2));
     }
 
     #[test]
@@ -60,7 +61,7 @@ mod tests {
     #[test]
     fn reports_did_not_exit_and_leaves_the_process_running() {
         let mut child = Command::new("sh")
-            .args(["-c", r#"trap "" TERM; echo ready; exec sleep 60"#])
+            .args(["-c", r#"trap "" INT; echo ready; exec sleep 60"#])
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
