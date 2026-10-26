@@ -10,6 +10,7 @@ pub struct SessionRecord {
     pub session_id: Option<String>,
     pub name: Option<String>,
     pub kind: Option<String>,
+    pub entrypoint: Option<String>,
     pub status: Option<String>,
     /// Milliseconds since the Unix epoch.
     pub status_updated_at: Option<i64>,
@@ -25,6 +26,7 @@ struct RecordFile {
     session_id: Option<String>,
     name: Option<String>,
     kind: Option<String>,
+    entrypoint: Option<String>,
     status: Option<String>,
     status_updated_at: Option<i64>,
     proc_start: Option<String>,
@@ -75,6 +77,7 @@ fn read_record(path: &Path, config_dir: &Path) -> Option<SessionRecord> {
         session_id: file.session_id,
         name: file.name,
         kind: file.kind,
+        entrypoint: file.entrypoint,
         status: file.status,
         status_updated_at: file.status_updated_at,
         proc_start: file.proc_start,
@@ -106,7 +109,7 @@ mod tests {
         fs::write(path, contents).unwrap();
     }
 
-    const INTERACTIVE_RECORD: &str = r#"{"pid":100,"sessionId":"s1","name":"fixture","kind":"interactive","status":"idle","statusUpdatedAt":1791580419201,"procStart":"2202283","version":"2.1.296"}"#;
+    const INTERACTIVE_RECORD: &str = r#"{"pid":100,"sessionId":"s1","name":"fixture","kind":"interactive","entrypoint":"claude-vscode","status":"idle","statusUpdatedAt":1791580419201,"procStart":"2202283","version":"2.1.296"}"#;
 
     #[test]
     fn reads_interactive_record_fields() {
@@ -122,6 +125,7 @@ mod tests {
                 session_id: Some("s1".to_string()),
                 name: Some("fixture".to_string()),
                 kind: Some("interactive".to_string()),
+                entrypoint: Some("claude-vscode".to_string()),
                 status: Some("idle".to_string()),
                 status_updated_at: Some(1791580419201),
                 proc_start: Some("2202283".to_string()),

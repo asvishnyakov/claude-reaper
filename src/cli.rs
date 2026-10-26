@@ -7,7 +7,7 @@ use chrono::{DateTime, Local};
 use clap::{Args, Parser, Subcommand};
 
 use crate::process::{self, Identity};
-use crate::reaper::{Decision, decide, still_stoppable};
+use crate::reaper::{DEFAULT_ENTRYPOINT, Decision, Rules, decide, still_stoppable};
 use crate::sessions::{SessionRecord, canonical, read_records, session_config_dirs};
 use crate::stop::{self, StopOutcome};
 
@@ -32,6 +32,10 @@ pub struct RunArguments {
     /// Extra config directory to look in; may be repeated
     #[arg(long)]
     pub config_dir: Vec<PathBuf>,
+    /// Client whose sessions may be stopped, as recorded in the session's entrypoint; may be
+    /// repeated, and replaces the default
+    #[arg(long, default_value = DEFAULT_ENTRYPOINT, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    pub entrypoint: Vec<String>,
     /// Print what would be stopped and stop nothing
     #[arg(long)]
     pub dry_run: bool,
@@ -49,13 +53,11 @@ pub fn main() -> ExitCode {
         &run.config_dir,
         &mut io::stderr(),
     );
-    let result = sweep(
-        &dirs,
-        Local::now(),
-        run.idle_minutes,
-        run.dry_run,
-        &mut io::stdout(),
-    );
+    let rules = Rules {
+        idle_minutes: run.idle_minutes,
+        entrypoints: run.entrypoint,
+    };
+    let result = sweep(&dirs, Local::now(), &rules, run.dry_run, &mut io::stdout());
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -118,13 +120,13 @@ pub fn config_dirs(
 pub fn sweep(
     config_dirs: &[ConfigDir],
     now: DateTime<Local>,
-    idle_minutes: u64,
+    rules: &Rules,
     dry_run: bool,
     output: &mut impl Write,
 ) -> io::Result<()> {
     for config_dir in config_dirs {
         let records = read_records(&config_dir.path);
-        for decision in decide(&records, now, idle_minutes) {
+        for decision in decide(&records, now, rules) {
             match decision {
                 Decision::Skip { record, reason } => {
                     writeln!(output, "skip {} ({}): {reason}", record.pid, name(record))?;
@@ -132,7 +134,7 @@ pub fn sweep(
                 Decision::Stop {
                     record,
                     idle_minutes: idle_for_minutes,
-                } if still_stoppable(record, now, idle_minutes) => {
+                } if still_stoppable(record, now, rules) => {
                     stop_session(record, config_dir.origin, idle_for_minutes, dry_run, output)?;
                 }
                 Decision::Stop { record, .. } => {
@@ -226,19 +228,64 @@ mod tests {
         assert_eq!(run.config_dir, [PathBuf::from("/a"), PathBuf::from("/b")]);
     }
 
+    #[test]
+    fn entrypoint_defaults_to_claude_vscode() {
+        let arguments = Arguments::try_parse_from(["claude-reaper", "run"]).unwrap();
+        let Command::Run(run) = arguments.command;
+        assert_eq!(run.entrypoint, ["claude-vscode"]);
+    }
+
+    #[test]
+    fn entrypoint_values_replace_the_default() {
+        let arguments = Arguments::try_parse_from([
+            "claude-reaper",
+            "run",
+            "--entrypoint",
+            "cli",
+            "--entrypoint",
+            "sdk-py",
+        ])
+        .unwrap();
+        let Command::Run(run) = arguments.command;
+        assert_eq!(run.entrypoint, ["cli", "sdk-py"]);
+    }
+
+    #[test]
+    fn empty_entrypoint_is_rejected() {
+        let parsed = Arguments::try_parse_from(["claude-reaper", "run", "--entrypoint", ""]);
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn dry_run_reports_an_unselected_entrypoint() {
+        let pid = std::process::id();
+        let dir = fixture_for(pid, Some("fixture"), None, "cli");
+
+        let output = dry_run_output(dir.path());
+
+        let expected = format!("skip {pid} (fixture): entrypoint cli not selected");
+        assert!(output.contains(&expected), "{output}");
+    }
+
     const SCHEDULE_WAKEUP_CALL: &str = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"ScheduleWakeup","input":{}}]}}"#;
 
     /// A config directory holding one record for this test process: interactive, idle 20 minutes.
     fn fixture(name: Option<&str>, proc_start: Option<&str>) -> tempfile::TempDir {
-        fixture_for(std::process::id(), name, proc_start)
+        fixture_for(std::process::id(), name, proc_start, DEFAULT_ENTRYPOINT)
     }
 
-    fn fixture_for(pid: u32, name: Option<&str>, proc_start: Option<&str>) -> tempfile::TempDir {
+    fn fixture_for(
+        pid: u32,
+        name: Option<&str>,
+        proc_start: Option<&str>,
+        entrypoint: &str,
+    ) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let mut record = serde_json::json!({
             "pid": pid,
             "sessionId": "s1",
             "kind": "interactive",
+            "entrypoint": entrypoint,
             "status": "idle",
             "statusUpdatedAt": Local::now().timestamp_millis() - 20 * 60_000,
         });
@@ -267,7 +314,11 @@ mod tests {
 
     fn dry_run_output_for(dirs: &[ConfigDir]) -> String {
         let mut output = Vec::new();
-        sweep(dirs, Local::now(), 15, true, &mut output).unwrap();
+        let rules = Rules {
+            idle_minutes: 15,
+            entrypoints: vec![DEFAULT_ENTRYPOINT.to_string()],
+        };
+        sweep(dirs, Local::now(), &rules, true, &mut output).unwrap();
         String::from_utf8(output).unwrap()
     }
 
@@ -431,7 +482,7 @@ mod tests {
             .spawn()
             .unwrap();
         process::wait_for_environment(child.id());
-        let session = fixture_for(child.id(), Some("fixture"), None);
+        let session = fixture_for(child.id(), Some("fixture"), None, DEFAULT_ENTRYPOINT);
         // The record lives in the directory the process names.
         fs::rename(session.path().join("sessions"), dir.path().join("sessions")).unwrap();
         let discovered = ConfigDir {
