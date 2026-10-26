@@ -998,26 +998,37 @@ def session_ended_cleanly(checks: Checks, session: Session) -> None:
     checks.add("process gone", not is_running(session.pid), "the process is still running")
 
 
-def integration_case(reaper: Path, name: str, mode: Mode, flags: list[str], unselected_by_default: str | None) -> bool:
-    """`unselected_by_default`: the session's entrypoint when the default selection must skip it."""
-    checks = Checks({"Claude Code version": claude_version(), "launch mode": mode, "flags": flags})
+def run_integration_checks(checks: Checks, reaper: Path, mode: Mode, flags: list[str], unselected_by_default: str | None) -> None:
     session = start_session(mode)
     if session is None:
-        checks.add("session started", False, f"no record within {RECORD_TIMEOUT_SECONDS} s")
-    else:
-        try:
-            pid = session.pid
-            if checks.add("session idle", wait_for_status(session, "idle", IDLE_TIMEOUT_SECONDS) is not None, f"not idle within {IDLE_TIMEOUT_SECONDS} s"):
-                if unselected_by_default is not None:
-                    reaper_prints(
-                        checks, "dry run with default entrypoints skips it", reaper, session, ["--dry-run"],
-                        f"skip {pid} (", f"): entrypoint {unselected_by_default} not selected",
-                    )
-                reaper_prints(checks, "dry run reports it", reaper, session, [*flags, "--dry-run"], f"would stop {pid} (")
-                reaper_prints(checks, "run reports it stopped", reaper, session, flags, f"stopped {pid} (")
-                session_ended_cleanly(checks, session)
-        finally:
-            session.close()
+        checks.add("session started", False, f"no record; {last_start_failure.get('waited_seconds')} s waited, process exit code {last_start_failure.get('exit_code')}")
+        return
+    try:
+        pid = session.pid
+        if not checks.add("session idle", wait_for_status(session, "idle", IDLE_TIMEOUT_SECONDS) is not None, f"not idle within {IDLE_TIMEOUT_SECONDS} s"):
+            return
+        if unselected_by_default is not None:
+            reaper_prints(
+                checks, "dry run with default entrypoints skips it", reaper, session, ["--dry-run"],
+                f"skip {pid} (", f"): entrypoint {unselected_by_default} not selected",
+            )
+        reaper_prints(checks, "dry run reports it", reaper, session, [*flags, "--dry-run"], f"would stop {pid} (")
+        reaper_prints(checks, "run reports it stopped", reaper, session, flags, f"stopped {pid} (")
+        session_ended_cleanly(checks, session)
+    finally:
+        session.close()
+
+
+def integration_case(reaper: Path, name: str, mode: Mode, flags: list[str], unselected_by_default: str | None) -> bool:
+    """`unselected_by_default`: the session's entrypoint when the default selection must skip it.
+
+    An exception (no node, a reaper that hangs or is missing) is a failed check, so the other cases still run.
+    """
+    checks = Checks({"Claude Code version": claude_version(), "launch mode": mode, "flags": flags})
+    try:
+        run_integration_checks(checks, reaper, mode, flags, unselected_by_default)
+    except Exception as error:
+        checks.add("case completed", False, describe_error(error))
     report(f"Integration ({name})", INTEGRATION_QUESTION, checks.observations)
     return not checks.failed
 

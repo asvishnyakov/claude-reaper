@@ -140,6 +140,20 @@ class IntegrationGuardTests(unittest.TestCase):
         start_session.assert_not_called()
         run.assert_not_called()
 
+    def test_a_case_that_raises_is_a_failed_check_and_the_next_case_still_runs(self) -> None:
+        with (
+            unittest.mock.patch.dict("os.environ", {"GITHUB_ACTIONS": "true"}),
+            unittest.mock.patch.object(probe, "claude_version", return_value="2.1.310 (Claude Code)"),
+            unittest.mock.patch.object(probe, "start_session", side_effect=RuntimeError("node is not on PATH")) as start_session,
+            unittest.mock.patch.object(probe, "report") as report,
+        ):
+            result = probe.integration(Path("claude-reaper"))
+
+        self.assertEqual(result, 1)
+        self.assertEqual(start_session.call_count, 2)
+        observations = report.call_args_list[0].args[2]
+        self.assertIn("RuntimeError: node is not on PATH", observations["case completed"])
+
 
 if __name__ == "__main__":
     unittest.main()
