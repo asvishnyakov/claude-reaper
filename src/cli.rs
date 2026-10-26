@@ -326,7 +326,7 @@ mod tests {
         dry_run_output_for(&[named(config_dir)])
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn dir_name(dir: &Path) -> String {
         dir.file_name().unwrap().to_string_lossy().into_owned()
     }
@@ -413,19 +413,29 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn dry_run_reports_the_fixture_session() {
+        let pid = std::process::id();
+        let dir = fixture(Some("fixture"), Some(&process::proc_start_of(pid)));
+
+        let output = dry_run_output(dir.path());
+
+        let expected = format!(
+            "would stop {pid} (fixture, {}, idle 20 min)",
+            dir_name(dir.path())
+        );
+        assert!(output.contains(&expected), "{output}");
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn record_without_proc_start_is_unverified_off_linux() {
         let dir = fixture(Some("fixture"), None);
         let pid = std::process::id();
 
         let output = dry_run_output(dir.path());
 
-        #[cfg(target_os = "linux")]
-        let expected = format!(
-            "would stop {pid} (fixture, {}, idle 20 min)",
-            dir_name(dir.path())
-        );
-        #[cfg(not(target_os = "linux"))]
         let expected = format!("skip {pid} (fixture): process identity unverified");
         assert!(output.contains(&expected), "{output}");
     }
@@ -444,7 +454,7 @@ mod tests {
         assert!(output.contains(&expected), "{output}");
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn dry_run_reports_a_reused_pid() {
         let dir = fixture(Some("fixture"), Some("1"));

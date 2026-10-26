@@ -1,14 +1,10 @@
 use std::io;
-use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use rustix::io::Errno;
 use rustix::process::{Pid, Signal, kill_process};
 
-use super::StopOutcome;
-use crate::process::{Identity, identity};
-
-const POLL_INTERVAL: Duration = Duration::from_millis(100);
+use super::{StopOutcome, wait_for_exit};
 
 /// Sends `SIGINT`, which Claude Code answers with its own shutdown routine and exit code 0 (a client
 /// such as the VS Code extension reports any other exit as an error), then waits up to `grace` for
@@ -23,14 +19,7 @@ pub fn stop(pid: u32, proc_start: Option<&str>, grace: Duration) -> io::Result<S
         Err(Errno::SRCH) => return Ok(StopOutcome::Stopped),
         Err(error) => return Err(error.into()),
     }
-    let deadline = Instant::now() + grace;
-    while identity(pid, proc_start) == Identity::Same {
-        if Instant::now() >= deadline {
-            return Ok(StopOutcome::DidNotExit);
-        }
-        sleep(POLL_INTERVAL);
-    }
-    Ok(StopOutcome::Stopped)
+    Ok(wait_for_exit(pid, proc_start, grace))
 }
 
 #[cfg(test)]

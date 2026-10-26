@@ -38,6 +38,14 @@ pub fn identity(pid: u32, proc_start: Option<&str>) -> Identity {
     }
 }
 
+/// What Claude Code would record as `procStart` for `pid`.
+#[cfg(test)]
+pub(crate) fn proc_start_of(pid: u32) -> String {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    let (_, start_ticks) = parse_start_ticks(&stat).unwrap();
+    start_ticks.to_string()
+}
+
 /// Distinct absolute `CLAUDE_CONFIG_DIR` values of this user's running processes, this one included.
 pub fn running_config_dirs() -> Vec<PathBuf> {
     let uid = rustix::process::getuid().as_raw();

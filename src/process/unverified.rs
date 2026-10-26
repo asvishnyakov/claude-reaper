@@ -1,8 +1,10 @@
 use std::path::{Path, PathBuf};
 
+#[cfg(not(target_os = "macos"))]
 use super::Identity;
 
 /// What `procStart` means on this system has not been observed yet, so identity cannot be confirmed.
+#[cfg(not(target_os = "macos"))]
 pub fn identity(_pid: u32, _proc_start: Option<&str>) -> Identity {
     Identity::Unverified
 }
