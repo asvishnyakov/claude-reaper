@@ -29,7 +29,25 @@ struct RecordFile {
     entrypoint: Option<String>,
     status: Option<String>,
     status_updated_at: Option<i64>,
-    proc_start: Option<String>,
+    proc_start: Option<ProcStart>,
+}
+
+/// `procStart` as written: a string, or a number that is kept as its decimal text rather than
+/// making the whole record unreadable.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ProcStart {
+    Text(String),
+    Number(serde_json::Number),
+}
+
+impl From<ProcStart> for String {
+    fn from(proc_start: ProcStart) -> Self {
+        match proc_start {
+            ProcStart::Text(text) => text,
+            ProcStart::Number(number) => number.to_string(),
+        }
+    }
 }
 
 /// The path with symlinks and trailing separators resolved, so two spellings of one directory compare
@@ -80,7 +98,7 @@ fn read_record(path: &Path, config_dir: &Path) -> Option<SessionRecord> {
         entrypoint: file.entrypoint,
         status: file.status,
         status_updated_at: file.status_updated_at,
-        proc_start: file.proc_start,
+        proc_start: file.proc_start.map(String::from),
         config_dir: config_dir.to_path_buf(),
     })
 }
@@ -131,6 +149,24 @@ mod tests {
                 proc_start: Some("2202283".to_string()),
                 config_dir: dir.path().to_path_buf(),
             }]
+        );
+    }
+
+    #[test]
+    fn reads_numeric_proc_start_as_decimal_text() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(
+            dir.path(),
+            "sessions/100.json",
+            r#"{"pid":100,"procStart":134363229627676503}"#,
+        );
+
+        let records = read_records(dir.path());
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].proc_start,
+            Some("134363229627676503".to_string())
         );
     }
 

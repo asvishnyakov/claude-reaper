@@ -1,0 +1,93 @@
+//! The hidden `ctrl-c <pid>` helper, aimed at `ping` children started in different kinds of console.
+#![cfg(windows)]
+
+use std::os::windows::process::CommandExt;
+use std::process::{Child, Command, Stdio};
+use std::thread::sleep;
+use std::time::{Duration, Instant};
+
+use windows_sys::Win32::System::Threading::{
+    CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS,
+};
+
+/// `ping -n 60 127.0.0.1` created with `creation_flags`, its output discarded.
+fn spawn_ping(creation_flags: u32) -> Child {
+    Command::new("ping")
+        .args(["-n", "60", "127.0.0.1"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(creation_flags)
+        .spawn()
+        .unwrap()
+}
+
+/// The exit code of the reaper's helper sending Ctrl+C to `pid`, run as `stop` runs it.
+fn ctrl_c(pid: u32) -> Option<i32> {
+    Command::new(env!("CARGO_BIN_EXE_claude-reaper"))
+        .args(["ctrl-c", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap()
+        .code()
+}
+
+/// Whether `child` exits before `timeout` passes.
+fn exits_within(child: &mut Child, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        sleep(Duration::from_millis(50));
+    }
+}
+
+/// Ends a child the test spawned, whether or not it is still running.
+fn clean_up(mut child: Child) {
+    if child.try_wait().unwrap().is_none() {
+        child.kill().unwrap();
+    }
+    child.wait().unwrap();
+}
+
+#[test]
+fn ctrl_c_ends_a_process_in_its_own_console() {
+    let mut child = spawn_ping(CREATE_NEW_CONSOLE);
+
+    let code = ctrl_c(child.id());
+
+    let exited = exits_within(&mut child, Duration::from_secs(10));
+    clean_up(child);
+    assert_eq!(code, Some(0));
+    assert!(exited);
+}
+
+#[test]
+fn process_without_a_console_is_reported() {
+    let mut child = spawn_ping(DETACHED_PROCESS);
+
+    let code = ctrl_c(child.id());
+
+    let exited = exits_within(&mut child, Duration::from_secs(1));
+    clean_up(child);
+    assert_eq!(code, Some(2));
+    assert!(!exited);
+}
+
+#[test]
+fn process_ignoring_ctrl_c_keeps_running() {
+    let mut child = spawn_ping(CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP);
+
+    let code = ctrl_c(child.id());
+
+    let exited = exits_within(&mut child, Duration::from_secs(2));
+    clean_up(child);
+    assert_eq!(code, Some(0));
+    assert!(!exited);
+}

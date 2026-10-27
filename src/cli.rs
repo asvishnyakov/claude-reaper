@@ -22,6 +22,10 @@ pub struct Arguments {
 pub enum Command {
     /// Perform one sweep and exit
     Run(RunArguments),
+    /// Send Ctrl+C through the console of a process; `run` starts this to stop a session
+    #[cfg(windows)]
+    #[command(hide = true)]
+    CtrlC { pid: u32 },
 }
 
 #[derive(Debug, Args)]
@@ -42,7 +46,14 @@ pub struct RunArguments {
 }
 
 pub fn main() -> ExitCode {
-    let Command::Run(run) = Arguments::parse().command;
+    match Arguments::parse().command {
+        Command::Run(run) => run_sweep(run),
+        #[cfg(windows)]
+        Command::CtrlC { pid } => ExitCode::from(stop::send_ctrl_c(pid)),
+    }
+}
+
+fn run_sweep(run: RunArguments) -> ExitCode {
     let Some(home) = std::env::home_dir() else {
         eprintln!("error: cannot determine the home directory");
         return ExitCode::FAILURE;
@@ -184,6 +195,7 @@ fn stop_session(
         Identity::Same => match stop::stop(pid, proc_start, stop::GRACE) {
             Ok(StopOutcome::Stopped) => format!("stopped {label}"),
             Ok(StopOutcome::DidNotExit) => skip("did not exit after graceful stop"),
+            Ok(StopOutcome::NoConsole) => skip("no console to deliver Ctrl+C"),
             Ok(StopOutcome::Unsupported) => skip("graceful stop not verified on this OS"),
             Err(error) => {
                 eprintln!("error stopping {pid} ({name}): {error}");
@@ -204,10 +216,18 @@ mod tests {
 
     use super::*;
 
+    /// The arguments of a `run` command line.
+    fn run_arguments(command_line: &[&str]) -> RunArguments {
+        match Arguments::try_parse_from(command_line).unwrap().command {
+            Command::Run(run) => run,
+            #[cfg(windows)]
+            command => panic!("not a run command: {command:?}"),
+        }
+    }
+
     #[test]
     fn run_defaults_to_fifteen_idle_minutes_and_no_dry_run() {
-        let arguments = Arguments::try_parse_from(["claude-reaper", "run"]).unwrap();
-        let Command::Run(run) = arguments.command;
+        let run = run_arguments(&["claude-reaper", "run"]);
         assert_eq!(run.idle_minutes, 15);
         assert!(!run.dry_run);
         assert!(run.config_dir.is_empty());
@@ -215,39 +235,49 @@ mod tests {
 
     #[test]
     fn config_dir_is_repeatable() {
-        let arguments = Arguments::try_parse_from([
+        let run = run_arguments(&[
             "claude-reaper",
             "run",
             "--config-dir",
             "/a",
             "--config-dir",
             "/b",
-        ])
-        .unwrap();
-        let Command::Run(run) = arguments.command;
+        ]);
         assert_eq!(run.config_dir, [PathBuf::from("/a"), PathBuf::from("/b")]);
     }
 
     #[test]
     fn entrypoint_defaults_to_claude_vscode() {
-        let arguments = Arguments::try_parse_from(["claude-reaper", "run"]).unwrap();
-        let Command::Run(run) = arguments.command;
+        let run = run_arguments(&["claude-reaper", "run"]);
         assert_eq!(run.entrypoint, ["claude-vscode"]);
     }
 
     #[test]
     fn entrypoint_values_replace_the_default() {
-        let arguments = Arguments::try_parse_from([
+        let run = run_arguments(&[
             "claude-reaper",
             "run",
             "--entrypoint",
             "cli",
             "--entrypoint",
             "sdk-py",
-        ])
-        .unwrap();
-        let Command::Run(run) = arguments.command;
+        ]);
         assert_eq!(run.entrypoint, ["cli", "sdk-py"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ctrl_c_subcommand_is_hidden() {
+        use clap::CommandFactory;
+
+        let arguments = Arguments::try_parse_from(["claude-reaper", "ctrl-c", "1"]).unwrap();
+        let help = Arguments::command().render_help().to_string();
+
+        assert!(
+            matches!(arguments.command, Command::CtrlC { pid: 1 }),
+            "{arguments:?}"
+        );
+        assert!(!help.contains("ctrl-c"), "{help}");
     }
 
     #[test]
@@ -326,7 +356,6 @@ mod tests {
         dry_run_output_for(&[named(config_dir)])
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn dir_name(dir: &Path) -> String {
         dir.file_name().unwrap().to_string_lossy().into_owned()
     }
@@ -413,7 +442,6 @@ mod tests {
         );
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn dry_run_reports_the_fixture_session() {
         let pid = std::process::id();
@@ -454,7 +482,6 @@ mod tests {
         assert!(output.contains(&expected), "{output}");
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn dry_run_reports_a_reused_pid() {
         let dir = fixture(Some("fixture"), Some("1"));
@@ -466,7 +493,6 @@ mod tests {
         assert!(output.contains(&expected), "{output}");
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn discovered_directory_is_skipped_when_the_session_process_does_not_name_it() {
         let pid = std::process::id();
@@ -482,7 +508,6 @@ mod tests {
         assert!(output.contains(&expected), "{output}");
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn discovered_directory_is_acted_on_when_the_session_process_names_it() {
         let dir = tempfile::tempdir().unwrap();

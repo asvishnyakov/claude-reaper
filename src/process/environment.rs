@@ -50,8 +50,8 @@ pub fn names_config_dir(pid: u32, config_dir: &Path) -> bool {
 }
 
 /// `Some(true)` when `pid` runs as the same user as this process; `None` when either owner cannot be read.
-// Not called outside tests yet: process identity on Windows is to use it, while macOS reads the owner from `ps`.
-#[cfg_attr(not(test), allow(dead_code))]
+// Windows process identity calls this; macOS reads the owner from `ps`, so there only tests do.
+#[cfg_attr(all(not(test), target_os = "macos"), allow(dead_code))]
 pub fn owned_by_current_user(pid: u32) -> Option<bool> {
     let pid = Pid::from_u32(pid);
     let this_pid = sysinfo::get_current_pid().ok()?;

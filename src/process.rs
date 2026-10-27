@@ -31,13 +31,17 @@ pub use macos::identity;
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use macos::proc_start_of;
 
-// Windows takes process identity from here until it has its own; any other OS takes everything.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-mod unverified;
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub use unverified::identity;
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub use windows::identity;
+#[cfg(all(test, windows))]
+pub(crate) use windows::proc_start_of;
+
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-pub use unverified::{names_config_dir, running_config_dirs};
+mod unverified;
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+pub use unverified::{identity, names_config_dir, running_config_dirs};
 
 /// A sleeping child (`sleep 30`; on Windows `ping -n 30 127.0.0.1` with output discarded) with
 /// `CLAUDE_CONFIG_DIR` removed or set; returns once its environment is readable.
