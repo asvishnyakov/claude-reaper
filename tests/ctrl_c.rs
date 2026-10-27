@@ -1,14 +1,14 @@
-//! The hidden `ctrl-c <pid>` helper, aimed at `ping` children started in different kinds of console.
+//! The hidden `ctrl-c <pid>` helper, aimed at children started in different kinds of console.
 #![cfg(windows)]
 
+use std::io::{BufRead, BufReader};
 use std::os::windows::process::CommandExt;
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::System::Threading::{
-    CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS,
-};
+use windows_sys::Win32::System::Threading::{CREATE_NEW_CONSOLE, DETACHED_PROCESS};
 
 /// `ping -n 60 127.0.0.1` created with `creation_flags`, its output discarded.
 fn spawn_ping(creation_flags: u32) -> Child {
@@ -20,6 +20,31 @@ fn spawn_ping(creation_flags: u32) -> Child {
         .creation_flags(creation_flags)
         .spawn()
         .unwrap()
+}
+
+/// The `ignore_ctrl_c` example in a console of its own, once it reports that it ignores Ctrl+C.
+fn spawn_ignoring_ctrl_c() -> Child {
+    let program = Path::new(env!("CARGO_BIN_EXE_claude-reaper"))
+        .with_file_name("examples")
+        .join("ignore_ctrl_c.exe");
+    assert!(
+        program.is_file(),
+        "{} is missing; `cargo test` builds it",
+        program.display()
+    );
+    let mut child = Command::new(&program)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NEW_CONSOLE)
+        .spawn()
+        .unwrap();
+    let mut ready = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut ready)
+        .unwrap();
+    assert_eq!(ready.trim_end(), "ready");
+    child
 }
 
 /// The exit code and stderr of the reaper's helper sending Ctrl+C to `pid`, run as `stop` runs it
@@ -103,7 +128,8 @@ fn process_without_a_console_is_reported() {
 
 #[test]
 fn process_ignoring_ctrl_c_keeps_running() {
-    let mut child = spawn_ping(CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP);
+    // `CREATE_NEW_PROCESS_GROUP`, which would disable Ctrl+C, is ignored with `CREATE_NEW_CONSOLE`.
+    let mut child = spawn_ignoring_ctrl_c();
 
     let attempts = ctrl_c_once_the_console_exists(child.id());
 
