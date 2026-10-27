@@ -975,9 +975,14 @@ class Checks:
         return passed
 
 
-def reaper_prints(checks: Checks, label: str, reaper: Path, session: Session, flags: list[str], prefix: str, suffix: str = "") -> None:
-    """Runs `claude-reaper run --idle-minutes 0` on the session's config dir and checks for one output line."""
-    command = [str(reaper), "run", "--idle-minutes", "0", "--config-dir", str(session.config_dir), *flags]
+def reaper_prints(
+    checks: Checks, label: str, reaper: Path, session: Session, flags: list[str], prefix: str, suffix: str = "", config_dir: bool = True
+) -> None:
+    """Runs `claude-reaper run --idle-minutes 0` and checks for one output line.
+
+    `config_dir=False` leaves out `--config-dir`, so the reaper must find the session's directory itself.
+    """
+    command = [str(reaper), "run", "--idle-minutes", "0", *(["--config-dir", str(session.config_dir)] if config_dir else []), *flags]
     result = subprocess.run(command, capture_output=True, text=True, timeout=60, check=False)
     lines = result.stdout.splitlines()
     matched = any(line.startswith(prefix) and line.endswith(suffix) for line in lines)
@@ -1012,6 +1017,10 @@ def run_integration_checks(checks: Checks, reaper: Path, mode: Mode, flags: list
                 checks, "dry run with default entrypoints skips it", reaper, session, ["--dry-run"],
                 f"skip {pid} (", f"): entrypoint {unselected_by_default} not selected",
             )
+        reaper_prints(
+            checks, "dry run finds it without --config-dir", reaper, session, [*flags, "--dry-run"],
+            f"would stop {pid} (", config_dir=False,
+        )
         reaper_prints(checks, "dry run reports it", reaper, session, [*flags, "--dry-run"], f"would stop {pid} (")
         reaper_prints(checks, "run reports it stopped", reaper, session, flags, f"stopped {pid} (")
         session_ended_cleanly(checks, session)
@@ -1033,6 +1042,19 @@ def integration_case(reaper: Path, name: str, mode: Mode, flags: list[str], unse
     return not checks.failed
 
 
+IntegrationCase = tuple[str, Mode, list[str], str | None]  # name, launch mode, reaper flags, entrypoint unselected by default
+
+
+def integration_cases(platform: str) -> list[IntegrationCase]:
+    """A session a VS Code extension starts (piped), and the terminal one: a console on Windows, a pty elsewhere."""
+    terminal: IntegrationCase = (
+        ("console", "console", ["--entrypoint", "cli"], "cli")
+        if platform == "win32"
+        else ("terminal", "pty", ["--entrypoint", "cli"], "cli")
+    )
+    return [("VS Code style", "piped", [], None), terminal]
+
+
 def integration(reaper: Path) -> int:
     """Stops real sessions with claude-reaper: 0 when every check passed, 1 when one failed, 2 when refused.
 
@@ -1042,10 +1064,7 @@ def integration(reaper: Path) -> int:
     if os.environ.get("GITHUB_ACTIONS") != "true":
         print("refusing to run: the integration check stops sessions and runs only on GitHub Actions", file=sys.stderr)
         return 2
-    passed = [
-        integration_case(reaper, "VS Code style", "piped", [], None),
-        integration_case(reaper, "terminal", "pty", ["--entrypoint", "cli"], "cli"),
-    ]
+    passed = [integration_case(reaper, *case) for case in integration_cases(sys.platform)]
     return 0 if all(passed) else 1
 
 
