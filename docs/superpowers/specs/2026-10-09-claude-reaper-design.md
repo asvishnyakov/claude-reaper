@@ -67,7 +67,7 @@ The reaper looks in these places, and uses each one that contains `sessions/`, o
 
 Step 2 needs no configuration and finds exactly the profiles that have something running. Observed on Linux (2.1.294): each of three running sessions carried the variable in `/proc/<pid>/environ`, and it named the directory that held its session record. The session process itself is read, not its children, because `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1` removes the variable from child processes.
 
-Step 2 is implemented on Linux. How to read another process's environment on macOS and Windows is not known; probe P7 determines it, and until then those systems use steps 1 and 3 only, plus the reaper's own environment.
+Step 2 is implemented on all three systems. On macOS and Windows the environment is read with the `sysinfo` crate, which uses `sysctl` `KERN_PROCARGS2` on macOS and reads the process environment block with `ReadProcessMemory` on Windows, as probe P7 observed. A process whose environment cannot be read contributes nothing, and steps 1 and 3 still apply.
 
 Step 3 covers what step 2 cannot: systems where environments cannot be read, and a `CLAUDE_CONFIG_DIR` set in a user or managed settings file. In that case the variable is expected to be missing from the process's startup environment; this has not been tested.
 
@@ -141,14 +141,17 @@ Because step 1 would cost the reaper its own console and output, the sequence ru
 Two consequences are accepted and documented in the README:
 
 - Ctrl+C reaches every process attached to that console, including the shell that launched Claude Code. This is the same as the user pressing Ctrl+C in that terminal.
-- A session whose process has no console cannot be stopped gracefully. It is skipped with `skip … : no console to deliver Ctrl+C`. This is expected to be rare: it needs a launcher that creates the process detached. The VS Code extension (2.1.294) spawns the binary with piped stdio and `windowsHide: true`, not detached, which should give it a hidden console of its own; probe P5 confirms or refutes that.
+- A session whose process has no console cannot be stopped gracefully. It is skipped with `skip … : no console to deliver Ctrl+C`. This is expected to be rare: it needs a launcher that creates the process detached. The VS Code extension (2.1.294) spawns the binary with piped stdio and `windowsHide: true`, not detached, which should give it a hidden console of its own. Probe P5 showed this: `AttachConsole` succeeded for a session spawned that way, and Ctrl+C ended it with exit code 0. P5 imitated the extension's launch; it was not the extension itself.
 
 ## Process identity
 
 The recorded PID may have been reused by an unrelated process. Before stopping anything, the reaper confirms identity.
 
 - Linux: field 22 (start time in clock ticks) of `/proc/<pid>/stat` must equal the record's `procStart`. This is the script's current check.
-- macOS and Windows: the meaning of `procStart` is not known. Probe P2 below determines it, and the check is implemented from what the probe shows. Until then, identity counts as unverified and the session is skipped.
+- macOS: `procStart` is the output of `ps -o lstart=` run with `LC_ALL=C` and `TZ=UTC`. It is compared with that command's output for the PID after collapsing runs of whitespace, because `ps` pads days 1 to 9.
+- Windows: `procStart` is the `GetProcessTimes` creation FILETIME as a decimal integer, and must equal it.
+
+On macOS and Windows, a record without `procStart` is `process identity unverified` and is skipped.
 
 If the record has no `procStart`, the Linux script currently accepts the process. That is kept on Linux only.
 
