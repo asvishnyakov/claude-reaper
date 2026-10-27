@@ -466,15 +466,15 @@ mod tests {
         assert!(output.contains(&expected), "{output}");
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn discovered_directory_is_skipped_when_the_session_process_does_not_name_it() {
-        let dir = fixture(Some("fixture"), None);
+        let pid = std::process::id();
+        let dir = fixture(Some("fixture"), Some(&process::proc_start_of(pid)));
         let discovered = ConfigDir {
             path: dir.path().to_path_buf(),
             origin: Origin::Discovered,
         };
-        let pid = std::process::id();
 
         let output = dry_run_output_for(&[discovered]);
 
@@ -482,17 +482,17 @@ mod tests {
         assert!(output.contains(&expected), "{output}");
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn discovered_directory_is_acted_on_when_the_session_process_names_it() {
         let dir = tempfile::tempdir().unwrap();
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .env("CLAUDE_CONFIG_DIR", dir.path())
-            .spawn()
-            .unwrap();
-        process::wait_for_environment(child.id());
-        let session = fixture_for(child.id(), Some("fixture"), None, DEFAULT_ENTRYPOINT);
+        let mut child = process::spawn_with_config_dir(Some(dir.path()));
+        let session = fixture_for(
+            child.id(),
+            Some("fixture"),
+            Some(&process::proc_start_of(child.id())),
+            DEFAULT_ENTRYPOINT,
+        );
         // The record lives in the directory the process names.
         fs::rename(session.path().join("sessions"), dir.path().join("sessions")).unwrap();
         let discovered = ConfigDir {

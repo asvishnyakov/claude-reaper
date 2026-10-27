@@ -113,6 +113,7 @@ mod tests {
     use std::process::Command;
 
     use super::*;
+    use crate::process::spawn_with_config_dir;
 
     #[test]
     fn start_ticks_survive_parentheses_in_the_command_name() {
@@ -155,20 +156,9 @@ mod tests {
         assert_eq!(identity(pid, None), Identity::Different);
     }
 
-    fn sleeper_with_config_dir(config_dir: Option<&Path>) -> std::process::Child {
-        let mut command = Command::new("sleep");
-        command.arg("30").env_remove("CLAUDE_CONFIG_DIR");
-        if let Some(config_dir) = config_dir {
-            command.env("CLAUDE_CONFIG_DIR", config_dir);
-        }
-        let child = command.spawn().unwrap();
-        wait_for_environment(child.id());
-        child
-    }
-
     #[test]
     fn waiting_for_the_environment_ends_after_exec() {
-        let mut child = sleeper_with_config_dir(None);
+        let mut child = spawn_with_config_dir(None);
 
         let executable = fs::read_link(format!("/proc/{}/exe", child.id()));
         let environ = fs::read(format!("/proc/{}/environ", child.id())).unwrap();
@@ -179,7 +169,7 @@ mod tests {
     }
 
     fn names_config_dir_for(started_with: Option<&Path>, asked_about: &Path) -> bool {
-        let mut child = sleeper_with_config_dir(started_with);
+        let mut child = spawn_with_config_dir(started_with);
         let names = names_config_dir(child.id(), asked_about);
         child.kill().unwrap();
         child.wait().unwrap();
@@ -231,12 +221,7 @@ mod tests {
     #[test]
     fn finds_config_dir_of_a_running_process() {
         let dir = tempfile::tempdir().unwrap();
-        let mut child = Command::new("sleep")
-            .arg("30")
-            .env("CLAUDE_CONFIG_DIR", dir.path())
-            .spawn()
-            .unwrap();
-        wait_for_environment(child.id());
+        let mut child = spawn_with_config_dir(Some(dir.path()));
 
         let found = running_config_dirs();
 
@@ -247,18 +232,8 @@ mod tests {
 
     #[test]
     fn ignores_relative_and_empty_config_dir_values() {
-        let mut relative = Command::new("sleep")
-            .arg("30")
-            .env("CLAUDE_CONFIG_DIR", "relative/unique-marker")
-            .spawn()
-            .unwrap();
-        let mut empty = Command::new("sleep")
-            .arg("30")
-            .env("CLAUDE_CONFIG_DIR", "")
-            .spawn()
-            .unwrap();
-        wait_for_environment(relative.id());
-        wait_for_environment(empty.id());
+        let mut relative = spawn_with_config_dir(Some(Path::new("relative/unique-marker")));
+        let mut empty = spawn_with_config_dir(Some(Path::new("")));
 
         let found = running_config_dirs();
 
