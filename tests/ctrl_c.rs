@@ -22,16 +22,32 @@ fn spawn_ping(creation_flags: u32) -> Child {
         .unwrap()
 }
 
-/// The exit code of the reaper's helper sending Ctrl+C to `pid`, run as `stop` runs it.
-fn ctrl_c(pid: u32) -> Option<i32> {
-    Command::new(env!("CARGO_BIN_EXE_claude-reaper"))
+/// The exit code and stderr of the reaper's helper sending Ctrl+C to `pid`, run as `stop` runs it
+/// except that stderr is captured.
+fn ctrl_c(pid: u32) -> (Option<i32>, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_claude-reaper"))
         .args(["ctrl-c", &pid.to_string()])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .unwrap()
-        .code()
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// Every attempt of the helper on `pid`, retried every 100 ms for up to 5 s while it exits 2: a
+/// console created with the child may not exist yet when `spawn` returns. The last is the result.
+fn ctrl_c_once_the_console_exists(pid: u32) -> Vec<(Option<i32>, String)> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut attempts = vec![ctrl_c(pid)];
+    while attempts.last().unwrap().0 == Some(2) && Instant::now() < deadline {
+        sleep(Duration::from_millis(100));
+        attempts.push(ctrl_c(pid));
+    }
+    attempts
 }
 
 /// Whether `child` exits before `timeout` passes.
@@ -60,34 +76,44 @@ fn clean_up(mut child: Child) {
 fn ctrl_c_ends_a_process_in_its_own_console() {
     let mut child = spawn_ping(CREATE_NEW_CONSOLE);
 
-    let code = ctrl_c(child.id());
+    let attempts = ctrl_c_once_the_console_exists(child.id());
 
     let exited = exits_within(&mut child, Duration::from_secs(10));
     clean_up(child);
-    assert_eq!(code, Some(0));
-    assert!(exited);
+    assert_eq!(
+        attempts.last().unwrap().0,
+        Some(0),
+        "{} attempts: {attempts:?}",
+        attempts.len()
+    );
+    assert!(exited, "{} attempts: {attempts:?}", attempts.len());
 }
 
 #[test]
 fn process_without_a_console_is_reported() {
     let mut child = spawn_ping(DETACHED_PROCESS);
 
-    let code = ctrl_c(child.id());
+    let (code, stderr) = ctrl_c(child.id());
 
     let exited = exits_within(&mut child, Duration::from_secs(1));
     clean_up(child);
-    assert_eq!(code, Some(2));
-    assert!(!exited);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(!exited, "{stderr}");
 }
 
 #[test]
 fn process_ignoring_ctrl_c_keeps_running() {
     let mut child = spawn_ping(CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP);
 
-    let code = ctrl_c(child.id());
+    let attempts = ctrl_c_once_the_console_exists(child.id());
 
     let exited = exits_within(&mut child, Duration::from_secs(2));
     clean_up(child);
-    assert_eq!(code, Some(0));
-    assert!(!exited);
+    assert_eq!(
+        attempts.last().unwrap().0,
+        Some(0),
+        "{} attempts: {attempts:?}",
+        attempts.len()
+    );
+    assert!(!exited, "{} attempts: {attempts:?}", attempts.len());
 }
