@@ -229,3 +229,4 @@ irm https://github.com/asvishnyakov/claude-reaper/releases/latest/download/claud
 - Done 2026-10-09, as reported by the repository owner: `claude setup-token` was run and the result added as the `CLAUDE_CODE_OAUTH_TOKEN` repository secret.
 - How to get past first-run onboarding (theme, folder trust) unattended is not yet known; P1 establishes it.
 - Done 2026-10-26: P3b confirmed on Linux and macOS (2.1.310) that `SIGINT` ends an idle session with exit code 0 and removes its record, for terminal and pipe-started sessions (see the [P3b row](../../probes/README.md)). macOS stop with `SIGINT` is implemented in the next plan; until then it stays unsupported.
+- Done 2026-10-27: macOS and Windows identity, stop and config-directory discovery implemented from P2, P3b, P4, P5 and P7; the integration check passes on all three systems (workflow run 40429997381).

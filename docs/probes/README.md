@@ -2,7 +2,7 @@
 
 Every result here except P3b was observed on **Claude Code 2.1.296** on GitHub-hosted runners (`ubuntu-latest`: Linux 6.17; `macos-latest`: macOS 26.6.2, arm64; `windows-latest`: Windows Server 2025, build 26100), by [`probes/probe.py`](../../probes/probe.py) in workflow run 38324636651 (commit `010d64c`). Raw output: [Linux](linux.md), [macOS](macos.md), [Windows](windows.md). An earlier run (38324245155) gave the same answers, except that its Windows "other processes on its console" count was wrong (the helper counted itself); only the later run's figures are used. P3b was observed on **Claude Code 2.1.310** on the same runner labels, in workflow run 40354834423 (commit `7ce8806`).
 
-The next plan (macOS and Windows `process` and `stop`, `daemon`, `install` and `uninstall`, release) is written from this table.
+macOS and Windows `process` and `stop` were implemented from this table, and the integration check stopped real sessions with exit code 0 on all three systems (workflow run 40429997381, commit `94d2033`, Claude Code 2.1.310). `daemon`, `install` and `uninstall`, and release follow.
 
 Later local checks on 2.1.310 (exit code per stop signal, how VS Code and terminal sessions take a stop, entrypoints) are in [stop-signal-local.md](stop-signal-local.md). They led to stopping with `SIGINT` instead of `SIGTERM` and selecting sessions by entrypoint (spec amendment of 2026-10-25); P3b confirms `SIGINT` in CI.
 
