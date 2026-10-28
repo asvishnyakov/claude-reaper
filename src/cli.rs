@@ -6,6 +6,7 @@ use std::process::ExitCode;
 use chrono::{DateTime, Local};
 use clap::{Args, Parser, Subcommand};
 
+use crate::daemon;
 use crate::process::{self, Identity};
 use crate::reaper::{DEFAULT_ENTRYPOINT, Decision, Rules, decide, still_stoppable};
 use crate::sessions::{SessionRecord, canonical, read_records, session_config_dirs};
@@ -22,14 +23,17 @@ pub struct Arguments {
 pub enum Command {
     /// Perform one sweep and exit
     Run(RunArguments),
+    /// Repeat the sweep every interval, in the foreground
+    Daemon(DaemonArguments),
     /// Send Ctrl+C through the console of a process; `run` starts this to stop a session
     #[cfg(windows)]
     #[command(hide = true)]
     CtrlC { pid: u32 },
 }
 
+/// What every sweeping command takes: which sessions are stopped, and where to look for them.
 #[derive(Debug, Args)]
-pub struct RunArguments {
+pub struct SweepArguments {
     /// Minutes a session must have been idle before it is stopped
     #[arg(long, default_value_t = 15)]
     pub idle_minutes: u64,
@@ -40,42 +44,72 @@ pub struct RunArguments {
     /// repeated, and replaces the default
     #[arg(long, default_value = DEFAULT_ENTRYPOINT, value_parser = clap::builder::NonEmptyStringValueParser::new())]
     pub entrypoint: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct RunArguments {
+    #[command(flatten)]
+    pub sweep: SweepArguments,
     /// Print what would be stopped and stop nothing
     #[arg(long)]
     pub dry_run: bool,
 }
 
+#[derive(Debug, Args)]
+pub struct DaemonArguments {
+    #[command(flatten)]
+    pub sweep: SweepArguments,
+    /// Minutes between the end of one sweep and the start of the next
+    #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..))]
+    pub interval_minutes: u64,
+}
+
 pub fn main() -> ExitCode {
     match Arguments::parse().command {
-        Command::Run(run) => run_sweep(run),
+        Command::Run(run) => run_sweep(&run),
+        Command::Daemon(daemon) => daemon::run(&daemon),
         #[cfg(windows)]
         Command::CtrlC { pid } => ExitCode::from(stop::send_ctrl_c(pid)),
     }
 }
 
-fn run_sweep(run: RunArguments) -> ExitCode {
-    let Some(home) = std::env::home_dir() else {
-        eprintln!("error: cannot determine the home directory");
-        return ExitCode::FAILURE;
-    };
-    let dirs = config_dirs(
-        &home,
-        process::running_config_dirs(),
-        &run.config_dir,
+fn run_sweep(run: &RunArguments) -> ExitCode {
+    match sweep_once(
+        &run.sweep,
+        run.dry_run,
+        &mut io::stdout(),
         &mut io::stderr(),
-    );
-    let rules = Rules {
-        idle_minutes: run.idle_minutes,
-        entrypoints: run.entrypoint,
-    };
-    let result = sweep(&dirs, Local::now(), &rules, run.dry_run, &mut io::stdout());
-    match result {
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("error: {error}");
             ExitCode::FAILURE
         }
     }
+}
+
+/// Finds the config directories and sweeps them once. Err only when the sweep cannot run
+/// ("cannot determine the home directory") or writing fails.
+pub fn sweep_once(
+    arguments: &SweepArguments,
+    dry_run: bool,
+    output: &mut impl Write,
+    warnings: &mut impl Write,
+) -> io::Result<()> {
+    let Some(home) = std::env::home_dir() else {
+        return Err(io::Error::other("cannot determine the home directory"));
+    };
+    let dirs = config_dirs(
+        &home,
+        process::running_config_dirs(),
+        &arguments.config_dir,
+        warnings,
+    );
+    let rules = Rules {
+        idle_minutes: arguments.idle_minutes,
+        entrypoints: arguments.entrypoint.clone(),
+    };
+    sweep(&dirs, Local::now(), &rules, dry_run, output)
 }
 
 /// Where a config directory came from, which decides how far its records are trusted.
@@ -220,17 +254,24 @@ mod tests {
     fn run_arguments(command_line: &[&str]) -> RunArguments {
         match Arguments::try_parse_from(command_line).unwrap().command {
             Command::Run(run) => run,
-            #[cfg(windows)]
             command => panic!("not a run command: {command:?}"),
+        }
+    }
+
+    /// The arguments of a `daemon` command line.
+    fn daemon_arguments(command_line: &[&str]) -> DaemonArguments {
+        match Arguments::try_parse_from(command_line).unwrap().command {
+            Command::Daemon(daemon) => daemon,
+            command => panic!("not a daemon command: {command:?}"),
         }
     }
 
     #[test]
     fn run_defaults_to_fifteen_idle_minutes_and_no_dry_run() {
         let run = run_arguments(&["claude-reaper", "run"]);
-        assert_eq!(run.idle_minutes, 15);
+        assert_eq!(run.sweep.idle_minutes, 15);
         assert!(!run.dry_run);
-        assert!(run.config_dir.is_empty());
+        assert!(run.sweep.config_dir.is_empty());
     }
 
     #[test]
@@ -243,13 +284,16 @@ mod tests {
             "--config-dir",
             "/b",
         ]);
-        assert_eq!(run.config_dir, [PathBuf::from("/a"), PathBuf::from("/b")]);
+        assert_eq!(
+            run.sweep.config_dir,
+            [PathBuf::from("/a"), PathBuf::from("/b")]
+        );
     }
 
     #[test]
     fn entrypoint_defaults_to_claude_vscode() {
         let run = run_arguments(&["claude-reaper", "run"]);
-        assert_eq!(run.entrypoint, ["claude-vscode"]);
+        assert_eq!(run.sweep.entrypoint, ["claude-vscode"]);
     }
 
     #[test]
@@ -262,7 +306,7 @@ mod tests {
             "--entrypoint",
             "sdk-py",
         ]);
-        assert_eq!(run.entrypoint, ["cli", "sdk-py"]);
+        assert_eq!(run.sweep.entrypoint, ["cli", "sdk-py"]);
     }
 
     #[cfg(windows)]
@@ -278,6 +322,26 @@ mod tests {
             "{arguments:?}"
         );
         assert!(!help.contains("ctrl-c"), "{help}");
+    }
+
+    #[test]
+    fn daemon_defaults_to_five_interval_minutes() {
+        let daemon = daemon_arguments(&["claude-reaper", "daemon"]);
+        assert_eq!(daemon.interval_minutes, 5);
+        assert_eq!(daemon.sweep.idle_minutes, 15);
+    }
+
+    #[test]
+    fn zero_interval_is_rejected() {
+        let parsed =
+            Arguments::try_parse_from(["claude-reaper", "daemon", "--interval-minutes", "0"]);
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn daemon_has_no_dry_run() {
+        let parsed = Arguments::try_parse_from(["claude-reaper", "daemon", "--dry-run"]);
+        assert!(parsed.is_err());
     }
 
     #[test]
