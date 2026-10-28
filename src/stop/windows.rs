@@ -1,5 +1,6 @@
 use std::env;
 use std::io::{self, Write};
+use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -7,18 +8,22 @@ use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::System::Console::{
     AttachConsole, CTRL_C_EVENT, FreeConsole, GenerateConsoleCtrlEvent, SetConsoleCtrlHandler,
 };
+use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
 use super::{StopOutcome, wait_for_exit};
 
 /// Sends Ctrl+C through the target's console, which Claude Code answers as it does `SIGINT`, then
 /// waits up to `grace` for the process to exit. Never escalates. The sequence runs in a child
-/// (`<current exe> ctrl-c <pid>`) because it detaches the caller from its own console.
+/// (`<current exe> ctrl-c <pid>`) because it detaches the caller from its own console. The child
+/// gets no window: a caller without a console, such as the daemon, would otherwise flash a new one
+/// at every stop.
 pub fn stop(pid: u32, proc_start: Option<&str>, grace: Duration) -> io::Result<StopOutcome> {
     let status = Command::new(env::current_exe()?)
         .args(["ctrl-c", &pid.to_string()])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
         .status()?;
     match status.code() {
         Some(0) => Ok(wait_for_exit(pid, proc_start, grace)),

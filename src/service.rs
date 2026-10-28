@@ -1,4 +1,4 @@
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 use std::io;
 
 /// What the service manager runs: `program` with `arguments`.
@@ -8,9 +8,12 @@ pub struct Registration {
     pub arguments: Vec<String>,
 }
 
-// The systemd and launchd implementations construct these variants; the unsupported one (any other
-// OS) constructs none.
-#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+// The systemd, launchd and Task Scheduler implementations construct these variants; the unsupported
+// one (any other OS) constructs none.
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", windows)),
+    allow(dead_code)
+)]
 pub enum Uninstalled {
     /// What was removed.
     Removed(String),
@@ -27,13 +30,18 @@ mod launchd;
 #[cfg(target_os = "macos")]
 pub use launchd::{install, uninstall};
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
+mod task_scheduler;
+#[cfg(windows)]
+pub use task_scheduler::{install, uninstall};
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 mod unsupported;
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub use unsupported::{install, uninstall};
 
 /// Runs a service-manager command; Err naming the command, its exit status and stderr when it fails.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub(crate) fn run_tool(program: &str, arguments: &[&str]) -> io::Result<()> {
     use std::process::Command;
 
@@ -60,7 +68,7 @@ pub(crate) fn run_tool(program: &str, arguments: &[&str]) -> io::Result<()> {
 
 /// Whether a service-manager command exits with success, for probing state; Err only when it
 /// cannot run, naming the command.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn tool_succeeds(program: &str, arguments: &[&str]) -> io::Result<bool> {
     use std::process::{Command, Stdio};
 
@@ -73,7 +81,7 @@ pub(crate) fn tool_succeeds(program: &str, arguments: &[&str]) -> io::Result<boo
         .map_err(|error| cannot_run(&command_line(program, arguments), error))
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn command_line(program: &str, arguments: &[&str]) -> String {
     std::iter::once(program)
         .chain(arguments.iter().copied())
@@ -81,9 +89,28 @@ fn command_line(program: &str, arguments: &[&str]) -> String {
         .join(" ")
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn cannot_run(command: &str, error: io::Error) -> io::Error {
     io::Error::new(error.kind(), format!("cannot run {command}: {error}"))
+}
+
+/// `path` as the text of a service-manager command line; InvalidInput when it is not valid UTF-8.
+#[cfg(any(target_os = "macos", windows))]
+fn utf8(path: &std::path::Path) -> io::Result<&str> {
+    path.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path is not valid UTF-8: {}", path.display()),
+        )
+    })
+}
+
+/// `text` as XML character data.
+#[cfg(any(target_os = "macos", windows))]
+fn escape_xml(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]

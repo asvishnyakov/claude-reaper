@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::{Registration, Uninstalled, run_tool, tool_succeeds};
+use super::{Registration, Uninstalled, escape_xml, run_tool, tool_succeeds, utf8};
 
 pub const LABEL: &str = "io.github.asvishnyakov.claude-reaper";
 
@@ -76,36 +76,20 @@ fn home_directory() -> io::Result<PathBuf> {
     std::env::home_dir().ok_or_else(|| io::Error::other("cannot determine the home directory"))
 }
 
-fn utf8(path: &Path) -> io::Result<&str> {
-    path.to_str().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("path is not valid UTF-8: {}", path.display()),
-        )
-    })
-}
-
 /// The property list of an agent that runs `registration` when loaded and again after it fails,
 /// with its output in `log`. Rendered from `launchd.plist`.
 pub fn property_list(registration: &Registration, log: &str) -> String {
     let program_arguments = std::iter::once(&registration.program)
         .chain(&registration.arguments)
-        .map(|word| format!("        <string>{}</string>", escape(word)))
+        .map(|word| format!("        <string>{}</string>", escape_xml(word)))
         .collect::<Vec<_>>()
         .join("\n");
     format!(
         include_str!("launchd.plist"),
         label = LABEL,
         program_arguments = program_arguments,
-        log = escape(log),
+        log = escape_xml(log),
     )
-}
-
-/// `text` as XML character data.
-fn escape(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
 }
 
 #[cfg(test)]

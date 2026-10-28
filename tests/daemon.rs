@@ -28,6 +28,20 @@ fn write_record(config_dir: &Path) {
     fs::write(path, record.to_string()).unwrap();
 }
 
+/// The daemon on `config_dir` and the fixture's entrypoint only, with `home` as the home directory
+/// so that no real session is ever selected. The caller sets the standard streams.
+fn daemon_command(home: &Path, config_dir: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_claude-reaper"));
+    command
+        .arg("daemon")
+        .arg("--config-dir")
+        .arg(config_dir)
+        .args(["--entrypoint", "reaper-test-only"])
+        .env("HOME", home)
+        .env("USERPROFILE", home);
+    command
+}
+
 /// The lines of `source`, sent as they arrive until it closes.
 fn read_lines(source: impl Read + Send + 'static) -> Receiver<String> {
     let (sender, receiver) = mpsc::channel();
@@ -66,13 +80,7 @@ fn daemon_sweeps_at_start() {
     let home = tempfile::tempdir().unwrap();
     let config_dir = tempfile::tempdir().unwrap();
     write_record(config_dir.path());
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_claude-reaper"))
-        .arg("daemon")
-        .arg("--config-dir")
-        .arg(config_dir.path())
-        .args(["--entrypoint", "reaper-test-only"])
-        .env("HOME", home.path())
-        .env("USERPROFILE", home.path())
+    let mut daemon = daemon_command(home.path(), config_dir.path())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -86,4 +94,44 @@ fn daemon_sweeps_at_start() {
     daemon.kill().unwrap();
     daemon.wait().unwrap();
     assert_eq!(received.last(), Some(&expected), "{received:?}");
+}
+
+/// A daemon alone on its console, as Task Scheduler starts it, frees the console so that its window
+/// closes: no console is left for the Ctrl+C helper to attach to.
+#[cfg(windows)]
+#[test]
+fn daemon_alone_on_its_console_detaches_from_it() {
+    use std::os::windows::process::CommandExt;
+    use std::thread::sleep;
+
+    use windows_sys::Win32::System::Threading::CREATE_NEW_CONSOLE;
+
+    let home = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    write_record(config_dir.path());
+    let mut daemon = daemon_command(home.path(), config_dir.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NEW_CONSOLE)
+        .spawn()
+        .unwrap();
+    sleep(Duration::from_secs(2));
+
+    let helper = Command::new(env!("CARGO_BIN_EXE_claude-reaper"))
+        .args(["ctrl-c", &daemon.id().to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+
+    // Exit code 2 also means that the process is gone, so the daemon must still be running.
+    let running = daemon.try_wait().unwrap().is_none();
+    if running {
+        daemon.kill().unwrap();
+    }
+    daemon.wait().unwrap();
+    assert!(running, "the daemon exited");
+    assert_eq!(helper.code(), Some(2), "{helper}");
 }
