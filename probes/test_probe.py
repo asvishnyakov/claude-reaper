@@ -155,5 +155,15 @@ class IntegrationGuardTests(unittest.TestCase):
         self.assertIn("RuntimeError: node is not on PATH", observations["case completed"])
 
 
+class IntegrationCasesTests(unittest.TestCase):
+    def test_windows_integration_covers_console_and_piped_sessions(self) -> None:
+        self.assertEqual([case[1] for case in probe.integration_cases("win32")], ["piped", "console"])
+
+    def test_unix_integration_covers_terminal_and_piped_sessions(self) -> None:
+        for platform in ("linux", "darwin"):
+            with self.subTest(platform=platform):
+                self.assertEqual([case[1] for case in probe.integration_cases(platform)], ["piped", "pty"])
+
+
 if __name__ == "__main__":
     unittest.main()

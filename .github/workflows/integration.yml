@@ -15,9 +15,22 @@ permissions:
   contents: read
 
 jobs:
-  linux:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+  integration:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: linux
+            reaper: target/debug/claude-reaper
+          - os: macos-latest
+            label: macos
+            reaper: target/debug/claude-reaper
+          - os: windows-latest
+            label: windows
+            reaper: target/debug/claude-reaper.exe
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install stable Rust
@@ -31,9 +44,9 @@ jobs:
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
         # --no-build: only hash-locked wheels run here; a source build would fetch an unpinned build backend.
-        run: uv run --locked --no-build probes/probe.py --os linux --integration target/debug/claude-reaper
+        run: uv run --locked --no-build probes/probe.py --os ${{ matrix.label }} --integration ${{ matrix.reaper }}
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
-          name: integration-results-linux
+          name: integration-results-${{ matrix.label }}
           path: results/

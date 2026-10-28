@@ -11,11 +11,66 @@ pub enum Identity {
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(all(test, target_os = "linux"))]
-pub(crate) use linux::wait_for_environment;
+pub(crate) use linux::proc_start_of;
+#[cfg(all(test, target_os = "linux"))]
+use linux::wait_for_environment;
 #[cfg(target_os = "linux")]
 pub use linux::{identity, names_config_dir, running_config_dirs};
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(target_os = "macos", windows))]
+mod environment;
+#[cfg(all(test, any(target_os = "macos", windows)))]
+use environment::wait_for_environment;
+#[cfg(any(target_os = "macos", windows))]
+pub use environment::{names_config_dir, running_config_dirs};
+
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+pub use macos::identity;
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) use macos::proc_start_of;
+
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub use windows::identity;
+#[cfg(all(test, windows))]
+pub(crate) use windows::proc_start_of;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 mod unverified;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub use unverified::{identity, names_config_dir, running_config_dirs};
+
+/// A sleeping child (`sleep 30`; on Windows `ping -n 30 127.0.0.1` with output discarded) with
+/// `CLAUDE_CONFIG_DIR` removed or set; returns once its environment is readable.
+#[cfg(test)]
+pub(crate) fn spawn_with_config_dir(config_dir: Option<&std::path::Path>) -> std::process::Child {
+    use std::process::Command;
+
+    #[cfg(windows)]
+    let mut command = {
+        use std::process::Stdio;
+
+        let mut command = Command::new("ping");
+        command
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command
+    };
+    #[cfg(not(windows))]
+    let mut command = {
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        command
+    };
+    command.env_remove("CLAUDE_CONFIG_DIR");
+    if let Some(config_dir) = config_dir {
+        command.env("CLAUDE_CONFIG_DIR", config_dir);
+    }
+    let child = command.spawn().unwrap();
+    wait_for_environment(child.id());
+    child
+}
