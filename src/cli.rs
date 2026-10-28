@@ -9,6 +9,7 @@ use clap::{Args, Parser, Subcommand};
 use crate::daemon;
 use crate::process::{self, Identity};
 use crate::reaper::{DEFAULT_ENTRYPOINT, Decision, Rules, decide, still_stoppable};
+use crate::service::{self, Registration, Uninstalled};
 use crate::sessions::{SessionRecord, canonical, read_records, session_config_dirs};
 use crate::stop::{self, StopOutcome};
 
@@ -25,6 +26,10 @@ pub enum Command {
     Run(RunArguments),
     /// Repeat the sweep every interval, in the foreground
     Daemon(DaemonArguments),
+    /// Register the daemon to start at login and restart on failure
+    Install(DaemonArguments),
+    /// Remove the daemon's registration
+    Uninstall,
     /// Send Ctrl+C through the console of a process; `run` starts this to stop a session
     #[cfg(windows)]
     #[command(hide = true)]
@@ -68,6 +73,8 @@ pub fn main() -> ExitCode {
     match Arguments::parse().command {
         Command::Run(run) => run_sweep(&run),
         Command::Daemon(daemon) => daemon::run(&daemon),
+        Command::Install(daemon) => install(&daemon),
+        Command::Uninstall => uninstall(),
         #[cfg(windows)]
         Command::CtrlC { pid } => ExitCode::from(stop::send_ctrl_c(pid)),
     }
@@ -86,6 +93,75 @@ fn run_sweep(run: &RunArguments) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn install(arguments: &DaemonArguments) -> ExitCode {
+    report(register(arguments).map(|description| format!("installed {description}")))
+}
+
+fn register(arguments: &DaemonArguments) -> io::Result<String> {
+    let program = std::env::current_exe()?;
+    let current_dir = std::env::current_dir()?;
+    service::install(&registration(&program, arguments, &current_dir)?)
+}
+
+fn uninstall() -> ExitCode {
+    report(service::uninstall().map(|uninstalled| match uninstalled {
+        Uninstalled::Removed(description) => format!("uninstalled {description}"),
+        Uninstalled::NotInstalled => "not installed".to_string(),
+    }))
+}
+
+/// Prints the line, or `error: …` to stderr, and exits accordingly.
+fn report(result: io::Result<String>) -> ExitCode {
+    match result {
+        Ok(line) => {
+            println!("{line}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `program` and `daemon` with every option written out; relative --config-dir joined to `current_dir`.
+/// InvalidInput when a path is not valid UTF-8.
+pub fn registration(
+    program: &Path,
+    arguments: &DaemonArguments,
+    current_dir: &Path,
+) -> io::Result<Registration> {
+    let sweep = &arguments.sweep;
+    let mut words = vec![
+        "daemon".to_string(),
+        "--idle-minutes".to_string(),
+        sweep.idle_minutes.to_string(),
+        "--interval-minutes".to_string(),
+        arguments.interval_minutes.to_string(),
+    ];
+    for config_dir in &sweep.config_dir {
+        words.push("--config-dir".to_string());
+        words.push(utf8(&current_dir.join(config_dir))?);
+    }
+    for entrypoint in &sweep.entrypoint {
+        words.push("--entrypoint".to_string());
+        words.push(entrypoint.clone());
+    }
+    Ok(Registration {
+        program: utf8(program)?,
+        arguments: words,
+    })
+}
+
+fn utf8(path: &Path) -> io::Result<String> {
+    path.to_str().map(str::to_string).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path is not valid UTF-8: {}", path.display()),
+        )
+    })
 }
 
 /// Finds the config directories and sweeps them once. Err only when the sweep cannot run
@@ -359,6 +435,134 @@ mod tests {
 
         let expected = format!("skip {pid} (fixture): entrypoint cli not selected");
         assert!(output.contains(&expected), "{output}");
+    }
+
+    /// The arguments of an `install` command line.
+    fn install_arguments(command_line: &[&str]) -> DaemonArguments {
+        match Arguments::try_parse_from(command_line).unwrap().command {
+            Command::Install(install) => install,
+            command => panic!("not an install command: {command:?}"),
+        }
+    }
+
+    /// The words an `install` command line registers, as run from `current_dir`.
+    fn registered_words(command_line: &[&str], current_dir: &Path) -> Vec<String> {
+        let arguments = install_arguments(command_line);
+        let registration =
+            registration(Path::new("/opt/claude-reaper"), &arguments, current_dir).unwrap();
+        assert_eq!(registration.program, "/opt/claude-reaper");
+        registration.arguments
+    }
+
+    #[test]
+    fn install_with_defaults_registers_the_default_options() {
+        let words = registered_words(&["claude-reaper", "install"], Path::new("/work"));
+
+        assert_eq!(
+            words,
+            [
+                "daemon",
+                "--idle-minutes",
+                "15",
+                "--interval-minutes",
+                "5",
+                "--entrypoint",
+                "claude-vscode"
+            ]
+        );
+    }
+
+    #[test]
+    fn install_registers_every_option() {
+        let config_dir = std::env::temp_dir().join("a");
+        let config_dir = config_dir.to_str().unwrap();
+
+        let words = registered_words(
+            &[
+                "claude-reaper",
+                "install",
+                "--idle-minutes",
+                "30",
+                "--interval-minutes",
+                "2",
+                "--config-dir",
+                config_dir,
+                "--entrypoint",
+                "cli",
+                "--entrypoint",
+                "sdk-py",
+            ],
+            Path::new("/work"),
+        );
+
+        assert_eq!(
+            words,
+            [
+                "daemon",
+                "--idle-minutes",
+                "30",
+                "--interval-minutes",
+                "2",
+                "--config-dir",
+                config_dir,
+                "--entrypoint",
+                "cli",
+                "--entrypoint",
+                "sdk-py"
+            ]
+        );
+    }
+
+    #[test]
+    fn relative_config_dir_is_registered_as_absolute() {
+        let current_dir = tempfile::tempdir().unwrap();
+
+        let words = registered_words(
+            &["claude-reaper", "install", "--config-dir", "profile"],
+            current_dir.path(),
+        );
+
+        let expected = current_dir.path().join("profile");
+        let position = words
+            .iter()
+            .position(|word| word == "--config-dir")
+            .unwrap();
+        assert_eq!(words[position + 1], expected.to_str().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_dir_that_is_not_utf8_is_rejected() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let mut arguments = install_arguments(&["claude-reaper", "install"]);
+        arguments
+            .sweep
+            .config_dir
+            .push(PathBuf::from(OsStr::from_bytes(b"/profile-\xff")));
+
+        let error = registration(
+            Path::new("/opt/claude-reaper"),
+            &arguments,
+            Path::new("/work"),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn uninstall_takes_no_options() {
+        let uninstall = Arguments::try_parse_from(["claude-reaper", "uninstall"]).unwrap();
+        let with_option =
+            Arguments::try_parse_from(["claude-reaper", "uninstall", "--idle-minutes", "5"]);
+
+        assert!(
+            matches!(uninstall.command, Command::Uninstall),
+            "{uninstall:?}"
+        );
+        assert!(with_option.is_err());
     }
 
     const SCHEDULE_WAKEUP_CALL: &str = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"ScheduleWakeup","input":{}}]}}"#;

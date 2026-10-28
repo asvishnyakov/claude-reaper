@@ -2,6 +2,7 @@ mod cli;
 mod daemon;
 mod process;
 mod reaper;
+mod service;
 mod sessions;
 mod stop;
 mod transcript;
