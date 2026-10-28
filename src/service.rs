@@ -1,4 +1,4 @@
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::io;
 
 /// What the service manager runs: `program` with `arguments`.
@@ -8,8 +8,9 @@ pub struct Registration {
     pub arguments: Vec<String>,
 }
 
-// Each OS implementation constructs only some of these variants; the unsupported one, none.
-#[allow(dead_code)]
+// The systemd and launchd implementations construct these variants; the unsupported one (any other
+// OS) constructs none.
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 pub enum Uninstalled {
     /// What was removed.
     Removed(String),
@@ -21,24 +22,26 @@ mod systemd;
 #[cfg(target_os = "linux")]
 pub use systemd::{install, uninstall};
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+mod launchd;
+#[cfg(target_os = "macos")]
+pub use launchd::{install, uninstall};
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod unsupported;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub use unsupported::{install, uninstall};
 
 /// Runs a service-manager command; Err naming the command, its exit status and stderr when it fails.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn run_tool(program: &str, arguments: &[&str]) -> io::Result<()> {
     use std::process::Command;
 
-    let command = std::iter::once(program)
-        .chain(arguments.iter().copied())
-        .collect::<Vec<_>>()
-        .join(" ");
+    let command = command_line(program, arguments);
     let output = Command::new(program)
         .args(arguments)
         .output()
-        .map_err(|error| io::Error::new(error.kind(), format!("cannot run {command}: {error}")))?;
+        .map_err(|error| cannot_run(&command, error))?;
     if output.status.success() {
         return Ok(());
     }
@@ -55,7 +58,35 @@ pub(crate) fn run_tool(program: &str, arguments: &[&str]) -> io::Result<()> {
     )))
 }
 
-#[cfg(all(test, target_os = "linux"))]
+/// Whether a service-manager command exits with success, for probing state; Err only when it
+/// cannot run, naming the command.
+#[cfg(target_os = "macos")]
+pub(crate) fn tool_succeeds(program: &str, arguments: &[&str]) -> io::Result<bool> {
+    use std::process::{Command, Stdio};
+
+    Command::new(program)
+        .args(arguments)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .map_err(|error| cannot_run(&command_line(program, arguments), error))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn command_line(program: &str, arguments: &[&str]) -> String {
+    std::iter::once(program)
+        .chain(arguments.iter().copied())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn cannot_run(command: &str, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("cannot run {command}: {error}"))
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
 
@@ -85,5 +116,26 @@ mod tests {
     #[test]
     fn succeeding_tool_is_ok() {
         run_tool("sh", &["-c", "exit 0"]).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn tool_succeeds_reports_the_exit_status_without_failing() {
+        assert!(tool_succeeds("sh", &["-c", "exit 0"]).unwrap());
+        assert!(!tool_succeeds("sh", &["-c", "exit 3"]).unwrap());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn tool_succeeds_names_the_command_it_cannot_run() {
+        let error = tool_succeeds("claude-reaper-no-such-tool", &["print"]).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(
+            error
+                .to_string()
+                .starts_with("cannot run claude-reaper-no-such-tool print: "),
+            "{error}"
+        );
     }
 }
