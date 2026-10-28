@@ -197,7 +197,7 @@ fn release_own_console();
 `task_definition`: `<?xml version="1.0" encoding="UTF-16"?>`, `<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">` with:
 - `LogonTrigger`, `Enabled` `true`, `UserId` `user`.
 - `Principal id="Author"`: `UserId` `user`, `LogonType` `InteractiveToken`, `RunLevel` `LeastPrivilege`.
-- `Settings`: `MultipleInstancesPolicy` `IgnoreNew`, `DisallowStartIfOnBatteries` `false`, `StopIfGoingOnBatteries` `false`, `ExecutionTimeLimit` `PT0S`, `RestartOnFailure` (`Interval` `PT1M`, `Count` `999`), `Enabled` `true`.
+- `Settings`: `MultipleInstancesPolicy` `IgnoreNew`, `DisallowStartIfOnBatteries` `false`, `StopIfGoingOnBatteries` `false`, `ExecutionTimeLimit` `PT0S`, `RestartOnFailure` (`Interval` `PT1M`, `Count` `255`), `Enabled` `true`.
 - `Actions Context="Author"`: `Exec` with `Command` the program and `Arguments` from `command_line_arguments`.
 Text is XML-escaped (`&`, `<`, `>`). `user` is `%USERDOMAIN%\%USERNAME%`; if either variable is missing, install fails with `error: …`.
 
@@ -206,7 +206,7 @@ Install: write the definition as UTF-16 LE with a BOM to `%TEMP%\claude-reaper-t
 `stop/windows.rs` starts the helper with `CommandExt::creation_flags(CREATE_NO_WINDOW)`. A daemon without a console would otherwise flash a new window at every stop.
 
 - [ ] **Step 1: Write the failing tests.**
-  - `src/service/task_scheduler.rs`: `arguments_with_spaces_quotes_and_trailing_backslashes_are_quoted` (`["daemon", r"C:\my dir\", "a\"b", ""]` → `daemon "C:\my dir\\" "a\"b" ""`); `task_definition_starts_at_logon_of_the_user_and_never_times_out` (contains `<UserId>DOMAIN\user</UserId>` twice, `<LogonType>InteractiveToken</LogonType>`, `<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>`, `<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>`, `<RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure>`, `<Command>C:\tools\claude-reaper.exe</Command>`); `task_definition_escapes_xml_characters`.
+  - `src/service/task_scheduler.rs`: `arguments_with_spaces_quotes_and_trailing_backslashes_are_quoted` (`["daemon", r"C:\my dir\", "a\"b", ""]` → `daemon "C:\my dir\\" "a\"b" ""`); `task_definition_starts_at_logon_of_the_user_and_never_times_out` (contains `<UserId>DOMAIN\user</UserId>` twice, `<LogonType>InteractiveToken</LogonType>`, `<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>`, `<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>`, `<RestartOnFailure><Interval>PT1M</Interval><Count>255</Count></RestartOnFailure>`, `<Command>C:\tools\claude-reaper.exe</Command>`); `task_definition_escapes_xml_characters`.
   - `tests/daemon.rs`: `#[cfg(windows)] daemon_alone_on_its_console_detaches_from_it`. Spawn the daemon as in Task 1, with `CREATE_NEW_CONSOLE` and without piped stdout; wait 2 s; `claude-reaper ctrl-c <pid>` exits `2`; then kill and wait the child.
 - [ ] **Step 2: Run** cross-target clippy for `x86_64-pc-windows-msvc` — expected: errors, no `task_scheduler` module.
 - [ ] **Step 3: Implement** `task_scheduler.rs`, the cfg wiring (`unsupported.rs` now only for systems that are none of the three), `release_own_console` and the helper's creation flag. Add `Win32_System_Threading`'s `CREATE_NO_WINDOW` from `windows-sys` (feature already enabled).

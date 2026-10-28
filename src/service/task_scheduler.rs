@@ -166,7 +166,7 @@ mod tests {
         );
 
         assert!(
-            text.starts_with("<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n"),
+            text.starts_with("<?xml version=\"1.0\" encoding=\"UTF-16\"?>"),
             "{text}"
         );
         assert!(text.contains("<LogonTrigger>"), "{text}");
@@ -182,7 +182,7 @@ mod tests {
             "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>",
             "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>",
             "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>",
-            "<RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure>",
+            "<RestartOnFailure><Interval>PT1M</Interval><Count>255</Count></RestartOnFailure>",
             r"<Command>C:\tools\claude-reaper.exe</Command>",
             "<Arguments>daemon</Arguments>",
         ] {
